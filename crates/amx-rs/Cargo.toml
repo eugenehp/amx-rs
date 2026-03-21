@@ -1,0 +1,40 @@
+[package]
+name = "amx-rs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "High-level ergonomic API for AMX (Apple Matrix eXtensions) - matrix and vector operations"
+repository = "https://github.com/eugenehp/amx-rs"
+keywords = ["amx", "matrix", "vector", "math", "simd"]
+categories = ["algorithms", "mathematics", "no-std"]
+
+[features]
+default = ["std"]
+std = []
+
+[lib]
+name = "amx"
+path = "src/lib.rs"
+
+[dependencies]
+amx-sys = { path = "../amx-sys", version = "0.0.3" }
+
+[dev-dependencies]
+amx-sys = { path = "../amx-sys", version = "0.0.3" }
+
+[[example]]
+name = "matrix_ops"
+path = "examples/matrix_ops.rs"
+
+[[example]]
+name = "vector_ops"
+path = "examples/vector_ops.rs"
+
+[[bench]]
+name = "scalar_vs_amx"
+path = "benches/scalar_vs_amx.rs"
+harness = false
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# Accelerate framework linked via #[link] in bench source

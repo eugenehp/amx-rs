@@ -1,0 +1,107 @@
+name: Benchmark
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: System info
+        run: |
+          sw_vers
+          sysctl -n machdep.cpu.brand_string || true
+          sysctl -n hw.ncpu
+          rustc --version
+          cargo --version
+
+      - name: Build
+        run: cargo build --workspace --release
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Run benchmark
+        run: |
+          STAMP=$(date +%Y%m%d-%H%M%S)
+          CHIP=$(sysctl -n machdep.cpu.brand_string 2>/dev/null | tr ' ()' '---' | tr '[:upper:]' '[:lower:]' || echo "unknown")
+          CSV_NAME="scalar-vs-amx-${CHIP}-${STAMP}.csv"
+          TXT_NAME="scalar-vs-amx-${CHIP}-${STAMP}.txt"
+
+          mkdir -p benchmark-results
+
+          BENCH_CSV="${GITHUB_WORKSPACE}/benchmark-results/${CSV_NAME}" \
+          BENCH_ITERS=20 \
+          BENCH_MAX_N=512 \
+          cargo bench -p amx-rs --bench scalar_vs_amx -- --nocapture \
+            2>&1 | tee "benchmark-results/${TXT_NAME}"
+
+          echo "CSV_NAME=${CSV_NAME}" >> $GITHUB_ENV
+          echo "TXT_NAME=${TXT_NAME}" >> $GITHUB_ENV
+          echo "STAMP=${STAMP}" >> $GITHUB_ENV
+
+      - name: Generate charts and results markdown
+        run: |
+          python3 scripts/chart_scalar_vs_amx.py "benchmark-results/${CSV_NAME}"
+          python3 scripts/generate_results_md.py "benchmark-results/${CSV_NAME}"
+
+      - name: Commit updated results and charts
+        if: github.ref == 'refs/heads/master' && github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f \
+            BENCHMARK_RESULTS.md \
+            figures/matmul-gflops-bar.svg \
+            figures/matmul-gflops-line.svg \
+            figures/matmul-latency-line.svg \
+            figures/dot-gflops-line.svg \
+            figures/rect-matmul-gflops-bar.svg
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "ci: update benchmark results and charts [skip ci]"
+            git push
+          fi
+
+      - name: Upload all benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ env.STAMP }}
+          path: |
+            benchmark-results/${{ env.CSV_NAME }}
+            benchmark-results/${{ env.TXT_NAME }}
+            BENCHMARK_RESULTS.md
+            figures/matmul-gflops-bar.svg
+            figures/matmul-gflops-line.svg
+            figures/matmul-latency-line.svg
+            figures/dot-gflops-line.svg
+            figures/rect-matmul-gflops-bar.svg
+          retention-days: 90
+
+      - name: Run instruction throughput benchmark
+        run: |
+          cargo bench -p amx-sys --bench amx_bench -- --nocapture \
+            2>&1 | tee "benchmark-results/ci-instruction-${STAMP}.txt"
+
+      - name: Upload instruction benchmark
+        uses: actions/upload-artifact@v4
+        with:
+          name: instruction-bench-${{ env.STAMP }}
+          path: benchmark-results/ci-instruction-*.txt
+          retention-days: 90

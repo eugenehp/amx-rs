@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 868" width="100%" height="auto">
+<rect width="1100" height="868" fill="#ffffff"/>
+<text x="24" y="32" font-size="22" font-family="Menlo, monospace" fill="#0f172a">All P-cores Parallel GFLOPS</text>
+<text x="24" y="52" font-size="12" font-family="Menlo, monospace" fill="#475569">Throughput with all P-cores running in parallel. Higher is better.</text>
+<rect x="260" y="62" width="12" height="12" rx="2" fill="#2563eb"/>
+<text x="276" y="73" font-size="11" font-family="Menlo, monospace" fill="#334155">Apple M1 Max</text>
+<rect x="480" y="62" width="12" height="12" rx="2" fill="#059669"/>
+<text x="496" y="73" font-size="11" font-family="Menlo, monospace" fill="#334155">Apple M3 Max</text>
+<rect x="700" y="62" width="12" height="12" rx="2" fill="#d97706"/>
+<text x="716" y="73" font-size="11" font-family="Menlo, monospace" fill="#334155">Apple M4 Pro</text>
+<rect x="920" y="62" width="12" height="12" rx="2" fill="#dc2626"/>
+<text x="936" y="73" font-size="11" font-family="Menlo, monospace" fill="#334155">Apple M4 Pro (Virtual)</text>
+<text x="16" y="121" font-size="12" font-family="Menlo, monospace" fill="#111827">fma16 matrix</text>
+<rect x="260" y="80" width="320.2" height="16" rx="3" fill="#2563eb"/>
+<text x="586.2" y="92" font-size="10" font-family="Menlo, monospace" fill="#334155">5015.0 GFLOPS</text>
+<rect x="260" y="98" width="720.0" height="16" rx="3" fill="#059669"/>
+<text x="986.0" y="110" font-size="10" font-family="Menlo, monospace" fill="#334155">11276.8 GFLOPS</text>
+<rect x="260" y="116" width="583.1" height="16" rx="3" fill="#d97706"/>
+<text x="849.1" y="128" font-size="10" font-family="Menlo, monospace" fill="#334155">9133.4 GFLOPS</text>
+<rect x="260" y="134" width="655.8" height="16" rx="3" fill="#dc2626"/>
+<text x="921.8" y="146" font-size="10" font-family="Menlo, monospace" fill="#334155">10270.7 GFLOPS</text>
+<text x="16" y="207" font-size="12" font-family="Menlo, monospace" fill="#111827">mac16 matrix</text>
+<rect x="260" y="166" width="175.5" height="16" rx="3" fill="#2563eb"/>
+<text x="441.5" y="178" font-size="10" font-family="Menlo, monospace" fill="#334155">2749.3 GFLOPS</text>
+<rect x="260" y="184" width="274.5" height="16" rx="3" fill="#059669"/>
+<text x="540.5" y="196" font-size="10" font-family="Menlo, monospace" fill="#334155">4299.1 GFLOPS</text>
+<rect x="260" y="202" width="257.9" height="16" rx="3" fill="#d97706"/>
+<text x="523.9" y="214" font-size="10" font-family="Menlo, monospace" fill="#334155">4039.3 GFLOPS</text>
+<rect x="260" y="220" width="347.8" height="16" rx="3" fill="#dc2626"/>
+<text x="613.8" y="232" font-size="10" font-family="Menlo, monospace" fill="#334155">5447.5 GFLOPS</text>
+<text x="16" y="293" font-size="12" font-family="Menlo, monospace" fill="#111827">fma32 matrix</text>
+<rect x="260" y="252" width="174.8" height="16" rx="3" fill="#2563eb"/>
+<text x="440.8" y="264" font-size="10" font-family="Menlo, monospace" fill="#334155">2737.7 GFLOPS</text>
+<rect x="260" y="270" width="303.7" height="16" rx="3" fill="#059669"/>
+<text x="569.7" y="282" font-size="10" font-family="Menlo, monospace" fill="#334155">4756.0 GFLOPS</text>
+<rect x="260" y="288" width="281.1" height="16" rx="3" fill="#d97706"/>
+<text x="547.1" y="300" font-size="10" font-family="Menlo, monospace" fill="#334155">4402.6 GFLOPS</text>
+<rect x="260" y="306" width="270.6" height="16" rx="3" fill="#dc2626"/>
+<text x="536.6" y="318" font-size="10" font-family="Menlo, monospace" fill="#334155">4238.7 GFLOPS</text>
+<text x="16" y="379" font-size="12" font-family="Menlo, monospace" fill="#111827">fma16 vector</text>
+<rect x="260" y="338" width="14.3" height="16" rx="3" fill="#2563eb"/>
+<text x="280.3" y="350" font-size="10" font-family="Menlo, monospace" fill="#334155">224.2 GFLOPS</text>
+<rect x="260" y="356" width="34.7" height="16" rx="3" fill="#059669"/>
+<text x="300.7" y="368" font-size="10" font-family="Menlo, monospace" fill="#334155">543.1 GFLOPS</text>
+<rect x="260" y="374" width="26.8" height="16" rx="3" fill="#d97706"/>
+<text x="292.8" y="386" font-size="10" font-family="Menlo, monospace" fill="#334155">420.4 GFLOPS</text>
+<rect x="260" y="392" width="32.9" height="16" rx="3" fill="#dc2626"/>
+<text x="298.9" y="404" font-size="10" font-family="Menlo, monospace" fill="#334155">515.1 GFLOPS</text>
+<text x="16" y="465" font-size="12" font-family="Menlo, monospace" fill="#111827">mac16 vector</text>
+<rect x="260" y="424" width="11.0" height="16" rx="3" fill="#2563eb"/>
+<text x="277.0" y="436" font-size="10" font-family="Menlo, monospace" fill="#334155">172.2 GFLOPS</text>
+<rect x="260" y="442" width="28.6" height="16" rx="3" fill="#059669"/>
+<text x="294.6" y="454" font-size="10" font-family="Menlo, monospace" fill="#334155">448.1 GFLOPS</text>
+<rect x="260" y="460" width="20.3" height="16" rx="3" fill="#d97706"/>
+<text x="286.3" y="472" font-size="10" font-family="Menlo, monospace" fill="#334155">318.2 GFLOPS</text>
+<rect x="260" y="478" width="22.7" height="16" rx="3" fill="#dc2626"/>
+<text x="288.7" y="490" font-size="10" font-family="Menlo, monospace" fill="#334155">355.9 GFLOPS</text>
+<text x="16" y="551" font-size="12" font-family="Menlo, monospace" fill="#111827">fma64 matrix</text>
+<rect x="260" y="510" width="45.5" height="16" rx="3" fill="#2563eb"/>
+<text x="311.5" y="522" font-size="10" font-family="Menlo, monospace" fill="#334155">712.4 GFLOPS</text>
+<rect x="260" y="528" width="71.6" height="16" rx="3" fill="#059669"/>
+<text x="337.6" y="540" font-size="10" font-family="Menlo, monospace" fill="#334155">1120.8 GFLOPS</text>
+<rect x="260" y="546" width="62.5" height="16" rx="3" fill="#d97706"/>
+<text x="328.5" y="558" font-size="10" font-family="Menlo, monospace" fill="#334155">978.5 GFLOPS</text>
+<rect x="260" y="564" width="62.8" height="16" rx="3" fill="#dc2626"/>
+<text x="328.8" y="576" font-size="10" font-family="Menlo, monospace" fill="#334155">983.4 GFLOPS</text>
+<text x="16" y="637" font-size="12" font-family="Menlo, monospace" fill="#111827">fma32 vector</text>
+<rect x="260" y="596" width="10.9" height="16" rx="3" fill="#2563eb"/>
+<text x="276.9" y="608" font-size="10" font-family="Menlo, monospace" fill="#334155">171.1 GFLOPS</text>
+<rect x="260" y="614" width="18.3" height="16" rx="3" fill="#059669"/>
+<text x="284.3" y="626" font-size="10" font-family="Menlo, monospace" fill="#334155">286.8 GFLOPS</text>
+<rect x="260" y="632" width="16.8" height="16" rx="3" fill="#d97706"/>
+<text x="282.8" y="644" font-size="10" font-family="Menlo, monospace" fill="#334155">262.9 GFLOPS</text>
+<rect x="260" y="650" width="16.8" height="16" rx="3" fill="#dc2626"/>
+<text x="282.8" y="662" font-size="10" font-family="Menlo, monospace" fill="#334155">262.8 GFLOPS</text>
+<text x="16" y="723" font-size="12" font-family="Menlo, monospace" fill="#111827">fma64 vector</text>
+<rect x="260" y="682" width="5.5" height="16" rx="3" fill="#2563eb"/>
+<text x="271.5" y="694" font-size="10" font-family="Menlo, monospace" fill="#334155">85.4 GFLOPS</text>
+<rect x="260" y="700" width="9.4" height="16" rx="3" fill="#059669"/>
+<text x="275.4" y="712" font-size="10" font-family="Menlo, monospace" fill="#334155">147.9 GFLOPS</text>
+<rect x="260" y="718" width="8.0" height="16" rx="3" fill="#d97706"/>
+<text x="274.0" y="730" font-size="10" font-family="Menlo, monospace" fill="#334155">125.6 GFLOPS</text>
+<rect x="260" y="736" width="8.5" height="16" rx="3" fill="#dc2626"/>
+<text x="274.5" y="748" font-size="10" font-family="Menlo, monospace" fill="#334155">133.1 GFLOPS</text>
+</svg>

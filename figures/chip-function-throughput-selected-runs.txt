@@ -1,0 +1,4 @@
+Apple M1 | macOS 26.3.1 | variants=42 | /Users/Shared/amx-rs/benchmark-results/amx-benchmark-apple-m1-26-3-1-20260320-152519.csv
+Apple M3 Max | macOS 26.3 | variants=42 | /Users/Shared/amx-rs/benchmark-results/amx-benchmark-apple-m3-max-26-3-20260320-151927.csv
+Apple M4 Pro | macOS 26.3.1 | variants=42 | /Users/Shared/amx-rs/benchmark-results/amx-benchmark-apple-m4-pro-26-3-1-20260320-152146.csv
+Apple M4 Pro (Virtual) | macOS 26.3.1 | variants=42 | /Users/Shared/amx-rs/benchmark-results/amx-benchmark-apple-m4-pro-virtual-26-3-1-20260320-121323.csv

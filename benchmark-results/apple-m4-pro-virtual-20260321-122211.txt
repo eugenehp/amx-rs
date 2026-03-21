@@ -1,0 +1,51 @@
+# Apple M4 Pro (Virtual)
+# 2026-03-21T19:22:11Z
+# Darwin 25.3.0 arm64
+# cores: 10
+# perflevels: 1
+# rust: rustc 1.94.0 (4a4ef493e 2026-03-02)
+
+
+╔══════════════════════════════════════════════════════════════════╗
+║  AMX Benchmark — Apple M4 Pro (Virtual)                         ║
+║  10 cores (single perf level)                                    ║
+╚══════════════════════════════════════════════════════════════════╝
+
+  Single P-core
+  instruction                       ns/op   Ginstr/s     GFLOPS
+  ------------------------------------------------------------
+  set + clr                          6.59       0.15          -
+  ldx + stx                         20.19       0.05          -
+  fma16 vector  (32 f16)             1.05       0.96      61.17
+  fma16 matrix  (32×32)              1.13       0.88    1808.99
+  fma32 vector  (16 f32)             1.07       0.94      30.01
+  fma32 matrix  (16×16)              1.05       0.95     486.73
+  fma64 vector  (8 f64)              1.05       0.95      15.26
+  fma64 matrix  (8×8)                1.07       0.94     119.98
+  mac16 vector  (32 i16)             1.06       0.95      60.63
+  mac16 matrix  (32×32)              1.07       0.93    1908.04
+
+  All P-cores parallel (10 threads)
+  instruction                     ns/op/thr   Ginstr/s     GFLOPS
+  --------------------------------------------------------------
+  fma16 vector  (32 f16)               1.30       8.56     547.59
+  fma16 matrix  (32×32)                3.37       5.34   10939.31
+  fma32 vector  (16 f32)               1.46       8.87     283.84
+  fma32 matrix  (16×16)                3.19       8.11    4153.92
+  fma64 vector  (8 f64)                1.62       8.48     135.74
+  fma64 matrix  (8×8)                  2.41       7.92    1013.34
+  mac16 vector  (32 i16)               2.24       5.56     355.90
+  mac16 matrix  (32×32)                8.83       2.55    5225.39
+
+  Whole chip (10 cores: 10P + 0E)
+  instruction                      Ginstr/s     GFLOPS
+  ----------------------------------------------------
+  fma16 vector  (32 f16)               7.83     500.90
+  fma16 matrix  (32×32)                4.15    8494.57
+  fma32 vector  (16 f32)               7.68     245.91
+  fma32 matrix  (16×16)                7.83    4010.93
+  fma64 vector  (8 f64)                8.42     134.68
+  fma64 matrix  (8×8)                  7.76     992.68
+  mac16 vector  (32 i16)               5.71     365.45
+  mac16 matrix  (32×32)                2.42    4960.20
+
