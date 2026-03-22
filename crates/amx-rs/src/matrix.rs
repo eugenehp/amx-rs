@@ -455,7 +455,8 @@ impl Matrix<f32> {
                         // Use cached transpose + Accelerate's CblasTrans for max speed.
                         // Accelerate with CblasTrans skips internal transpose → 1.7× faster.
                         #[cfg(target_os = "macos")]
-                        if m % 16 == 0 {
+                        if m % 16 == 0 && n <= 1024 {
+                        // CblasTrans with cached A: best for N≤1024 (~4MB cache)
                             let (a_col, a_stride) = self.ensure_col_cache();
                             let mut c_data = Vec::with_capacity(m * n);
                             unsafe { c_data.set_len(m * n); }
