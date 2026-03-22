@@ -607,33 +607,19 @@ void amx_pack_b(const float* b, int ldb, int k, int n, uint8_t* dst) {
     }
 }
 
-// Self-contained worker: packs BOTH A and B locally, computes, stores.
-// B packing is redundant across workers but keeps data hot in L1.
-void amx_sgemm_pack_and_compute(
+// Worker: uses shared pre-packed B, packs only its own A tiles.
+void amx_sgemm_worker(
     const float* a, int lda,
-    const float* b, int ldb,
+    const uint8_t* b_packed,
     float* c, int ldc,
     int m, int k, int n,
     int tile_start, int tile_end,
-    uint8_t* a_pack_buf, uint8_t* b_pack_buf, uint8_t* z_buf)
+    uint8_t* a_pack_buf, uint8_t* z_buf)
 {
     const int TILE = 16;
     const int TILE_BYTES = 64;
     int n_j_tiles = (n + TILE - 1) / TILE;
     
-    // Pack ALL B tiles locally (redundant but L1-hot)
-    for (int jt = 0; jt < n_j_tiles; jt++) {
-        int j_blk = jt * TILE;
-        int tile_n = TILE < (n - j_blk) ? TILE : (n - j_blk);
-        for (int kk = 0; kk < k; kk++) {
-            float* out = (float*)(b_pack_buf + (jt * k + kk) * TILE_BYTES);
-            const float* src = b + kk * ldb + j_blk;
-            __builtin_memcpy(out, src, tile_n * sizeof(float));
-            for (int jj = tile_n; jj < TILE; jj++) out[jj] = 0.0f;
-        }
-    }
-    
-    // Process assigned tiles
     int prev_it = -1;
     for (int idx = tile_start; idx < tile_end; idx++) {
         int it = idx / n_j_tiles;
@@ -648,7 +634,7 @@ void amx_sgemm_pack_and_compute(
             prev_it = it;
         }
         
-        const uint8_t* bp = b_pack_buf + jt * k * TILE_BYTES;
+        const uint8_t* bp = b_packed + jt * k * TILE_BYTES;
         amx_f32_tile_kernel_4y(a_pack_buf, bp, z_buf, k, tile_m);
         
         for (int ii = 0; ii < tile_m; ii++) {

@@ -19,7 +19,6 @@ mod inner {
         done_gen: AtomicU32,
         job: UnsafeCell<SgemmJob>,
         a_pack: *mut u8,
-        b_pack: *mut u8,
         z_buf: *mut u8,
     }
     unsafe impl Send for WorkerSlot {}
@@ -28,7 +27,7 @@ mod inner {
     #[repr(C)]
     struct SgemmJob {
         a: usize, lda: usize,
-        b: usize, ldb: usize,
+        b_packed: usize,  // pointer to shared pre-packed B
         c: usize, ldc: usize,
         m: usize, k: usize, n: usize,
         tile_start: usize, tile_end: usize,
@@ -38,6 +37,8 @@ mod inner {
         slots: Vec<WorkerSlot>,
         n_workers: usize,
         generation: AtomicU32,
+        b_pack: *mut u8,     // shared B packing buffer
+        b_pack_size: usize,
     }
 
     static mut POOL: *const AmxPool = core::ptr::null();
@@ -51,7 +52,7 @@ mod inner {
                 let n_workers = if n_cpus > 1 { n_cpus - 1 } else { 0 };
 
                 let a_sz = MAX_K_BUF * TILE_BYTES;
-                let b_sz = MAX_N_TILES * MAX_K_BUF * TILE_BYTES;
+                let b_pack_size = MAX_N_TILES * MAX_K_BUF * TILE_BYTES;
 
                 let mut slots = Vec::with_capacity(n_workers);
                 for _ in 0..n_workers {
@@ -59,7 +60,6 @@ mod inner {
                         done_gen: AtomicU32::new(0),
                         job: UnsafeCell::new(core::mem::zeroed()),
                         a_pack: aligned_alloc(a_sz, 128),
-                        b_pack: aligned_alloc(b_sz, 128),
                         z_buf: aligned_alloc(16 * TILE_BYTES, 128),
                     });
                 }
@@ -67,6 +67,8 @@ mod inner {
                 let pool = Box::leak(Box::new(AmxPool {
                     slots, n_workers,
                     generation: AtomicU32::new(0),
+                    b_pack: aligned_alloc(b_pack_size, 128),
+                    b_pack_size,
                 }));
                 POOL = pool as *const AmxPool;
 
@@ -105,13 +107,13 @@ mod inner {
             if job.tile_start < job.tile_end {
                 unsafe {
                     amx_sys::amx_set();
-                    amx_sys::amx_sgemm_pack_and_compute(
+                    amx_sys::amx_sgemm_worker(
                         job.a as *const f32, job.lda as i32,
-                        job.b as *const f32, job.ldb as i32,
+                        job.b_packed as *const u8,
                         job.c as *mut f32, job.ldc as i32,
                         job.m as i32, job.k as i32, job.n as i32,
                         job.tile_start as i32, job.tile_end as i32,
-                        slot.a_pack, slot.b_pack, slot.z_buf,
+                        slot.a_pack, slot.z_buf,
                     );
                     amx_sys::amx_clr();
                 }
@@ -134,57 +136,44 @@ mod inner {
         let pool = get_pool();
         let nw = pool.n_workers;
 
+        // Pack B ONCE on main thread (shared by all workers)
+        amx_sys::amx_pack_b(b, ldb as i32, k as i32, n as i32, pool.b_pack);
+
         if nw == 0 || total_tiles < 4 {
-            let a_sz = MAX_K_BUF * TILE_BYTES;
-            let b_sz = MAX_N_TILES * MAX_K_BUF * TILE_BYTES;
-            let a_buf = aligned_alloc(a_sz, 128);
-            let b_buf = aligned_alloc(b_sz, 128);
+            let a_buf = aligned_alloc(MAX_K_BUF * TILE_BYTES, 128);
             let z_buf = aligned_alloc(16 * TILE_BYTES, 128);
             amx_sys::amx_set();
-            amx_sys::amx_sgemm_pack_and_compute(
-                a, lda as i32, b, ldb as i32, c, ldc as i32,
+            amx_sys::amx_sgemm_worker(
+                a, lda as i32, pool.b_pack,
+                c, ldc as i32,
                 m as i32, k as i32, n as i32,
                 0, total_tiles as i32,
-                a_buf, b_buf, z_buf,
+                a_buf, z_buf,
             );
             amx_sys::amx_clr();
-            aligned_free(a_buf, a_sz, 128);
-            aligned_free(b_buf, b_sz, 128);
+            aligned_free(a_buf, MAX_K_BUF * TILE_BYTES, 128);
             aligned_free(z_buf, 16 * TILE_BYTES, 128);
             return;
         }
 
-        // Use all available workers — B packing redundancy is offset by
-        // L1 cache benefits (each worker's B is hot in its own L1).
-        let active = nw;
-
-        let tiles_per = (total_tiles + active - 1) / active;
+        // Distribute tiles across all workers
+        let tiles_per = (total_tiles + nw - 1) / nw;
         for i in 0..nw {
+            let start = i * tiles_per;
+            let end = ((i + 1) * tiles_per).min(total_tiles);
             let slot = &pool.slots[i];
             let job = &mut *slot.job.get();
-            if i < active {
-                let start = i * tiles_per;
-                let end = ((i + 1) * tiles_per).min(total_tiles);
-                *job = SgemmJob {
-                    a: a as usize, lda,
-                    b: b as usize, ldb,
-                    c: c as usize, ldc,
-                    m, k, n,
-                    tile_start: start, tile_end: end,
-                };
-            } else {
-                // Give empty range to unused workers
-                *job = SgemmJob {
-                    a: 0, lda: 0, b: 0, ldb: 0, c: 0, ldc: 0,
-                    m: 0, k: 0, n: 0,
-                    tile_start: 0, tile_end: 0,
-                };
-            }
+            *job = SgemmJob {
+                a: a as usize, lda,
+                b_packed: pool.b_pack as usize,
+                c: c as usize, ldc,
+                m, k, n,
+                tile_start: start, tile_end: end,
+            };
         }
 
         let gen = pool.generation.fetch_add(1, Ordering::Release) + 1;
 
-        // Wait only for active workers
         for i in 0..nw {
             let slot = &pool.slots[i];
             loop {

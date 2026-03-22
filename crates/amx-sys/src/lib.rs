@@ -111,14 +111,14 @@ extern "C" {
     /// Pack B tiles into contiguous layout.
     pub fn amx_pack_b(b: *const f32, ldb: i32, k: i32, n: i32, dst: *mut u8);
 
-    /// Self-contained sgemm: packs both A and B locally, computes, stores.
-    pub fn amx_sgemm_pack_and_compute(
+    /// Worker: uses shared pre-packed B, packs only own A tiles.
+    pub fn amx_sgemm_worker(
         a: *const f32, lda: i32,
-        b: *const f32, ldb: i32,
+        b_packed: *const u8,
         c: *mut f32, ldc: i32,
         m: i32, k: i32, n: i32,
         tile_start: i32, tile_end: i32,
-        a_pack_buf: *mut u8, b_pack_buf: *mut u8, z_buf: *mut u8,
+        a_pack_buf: *mut u8, z_buf: *mut u8,
     );
 
     /// Full tile loop: processes tile range [start..end) in a single C call.
