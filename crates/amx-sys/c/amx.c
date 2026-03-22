@@ -584,6 +584,105 @@ void amx_f32_tile_loop(
 // Forward declarations
 void neon_pack_a_tiles(const float* a, int m, int k, int start_it, int end_it, uint8_t* dst);
 
+// ── Fused gather+compute kernel: NEON gather interleaved with AMX ────
+//
+// Instead of: pack_all_A → compute_all_tiles (packing is 44% overhead)
+// This kernel: for each 4 k-steps, NEON-gather 4 A columns into Y,
+// then AMX ldx+fma32 for each B row. NEON and AMX use different
+// execution units so they can overlap.
+//
+// Processes one i-tile row across ALL j-tiles with ZERO pre-packing.
+void amx_fused_sgemm_row(
+    const float* a, int lda,   // A[i_blk+ii, kk] = a[(i_blk+ii)*lda + kk]
+    const float* b, int ldb,   // B[kk, j_blk+jj] = b[kk*ldb + j_blk+jj]  
+    float* c, int ldc,         // C[i_blk+ii, j_blk+jj]
+    int i_blk, int tile_m,
+    int k, int n,
+    uint8_t* z_buf)            // n_j_tiles × tile_m × 64 bytes
+{
+    const int TILE = 16;
+    const int TILE_BYTES = 64;
+    int n_j_tiles = (n + TILE - 1) / TILE;
+    
+    // Precompute A row pointers for this i-tile
+    const float* a_rows[16];
+    for (int ii = 0; ii < tile_m; ii++)
+        a_rows[ii] = a + (i_blk + ii) * lda;
+    
+    // Small stack buffer for column-gathered A (4 columns × 16 elements)
+    float __attribute__((aligned(64))) y_buf[4][16];
+    
+    for (int jt = 0; jt < n_j_tiles; jt++) {
+        int j_blk = jt * TILE;
+        int tile_n = TILE < (n - j_blk) ? TILE : (n - j_blk);
+        uint8_t* z_dst = z_buf + jt * tile_m * TILE_BYTES;
+        
+        // Zero Z
+        static const uint8_t zeros[64] __attribute__((aligned(128))) = {0};
+        uint64_t zbase = (uint64_t)zeros;
+        for (int r = 0; r < 16; r++)
+            AMX_OP_GPR(4, zbase | ((uint64_t)(r*4) << 56));
+        
+        // Fused gather + compute: 4 k-steps per iteration
+        #define FMA32_Y(row) ((uint64_t)(row) << 6)
+        int kk = 0;
+        for (; kk + 3 < k; kk += 4) {
+            // NEON gather 4 columns of A into y_buf
+            for (int ii = 0; ii < tile_m; ii++) {
+                float32x4_t v = vld1q_f32(a_rows[ii] + kk);
+                y_buf[0][ii] = vgetq_lane_f32(v, 0);
+                y_buf[1][ii] = vgetq_lane_f32(v, 1);
+                y_buf[2][ii] = vgetq_lane_f32(v, 2);
+                y_buf[3][ii] = vgetq_lane_f32(v, 3);
+            }
+            for (int ii = tile_m; ii < 16; ii++) {
+                y_buf[0][ii] = 0; y_buf[1][ii] = 0;
+                y_buf[2][ii] = 0; y_buf[3][ii] = 0;
+            }
+            
+            // Load 4 Y registers
+            AMX_OP_GPR(1, (uint64_t)y_buf[0] | (0ULL << 56));
+            AMX_OP_GPR(1, (uint64_t)y_buf[1] | (1ULL << 56));
+            AMX_OP_GPR(1, (uint64_t)y_buf[2] | (2ULL << 56));
+            AMX_OP_GPR(1, (uint64_t)y_buf[3] | (3ULL << 56));
+            
+            // Load B rows + fma32 (direct B or packed)
+            AMX_OP_GPR(0, (uint64_t)(b + (kk+0)*ldb + j_blk));
+            AMX_OP_GPR(12, FMA32_Y(0));
+            AMX_OP_GPR(0, (uint64_t)(b + (kk+1)*ldb + j_blk));
+            AMX_OP_GPR(12, FMA32_Y(1));
+            AMX_OP_GPR(0, (uint64_t)(b + (kk+2)*ldb + j_blk));
+            AMX_OP_GPR(12, FMA32_Y(2));
+            AMX_OP_GPR(0, (uint64_t)(b + (kk+3)*ldb + j_blk));
+            AMX_OP_GPR(12, FMA32_Y(3));
+        }
+        // Remainder
+        for (; kk < k; kk++) {
+            for (int ii = 0; ii < tile_m; ii++)
+                y_buf[0][ii] = a_rows[ii][kk];
+            for (int ii = tile_m; ii < 16; ii++)
+                y_buf[0][ii] = 0;
+            AMX_OP_GPR(1, (uint64_t)y_buf[0]);
+            AMX_OP_GPR(0, (uint64_t)(b + kk*ldb + j_blk));
+            AMX_OP_GPR(12, 0);
+        }
+        #undef FMA32_Y
+        
+        // Store Z
+        for (int r = 0; r < tile_m; r++)
+            AMX_OP_GPR(5, ((uint64_t)(z_dst + r*64)) | ((uint64_t)(r*4) << 56));
+    }
+    
+    // Bulk copy z_buf → C
+    for (int ii = 0; ii < tile_m; ii++)
+        for (int jt = 0; jt < n_j_tiles; jt++) {
+            int j_blk = jt * TILE;
+            int tile_n = TILE < (n - j_blk) ? TILE : (n - j_blk);
+            __builtin_memcpy(c + (i_blk+ii)*ldc + j_blk,
+                z_buf + (jt*tile_m + ii)*TILE_BYTES, tile_n*4);
+        }
+}
+
 // ── Batch store kernel: process i-row, store ALL j-tiles at once ─────
 //
 // Instead of store-Z per j-tile (86ns each), this stores all 
@@ -667,17 +766,18 @@ void amx_pack_b(const float* b, int ldb, int k, int n, uint8_t* dst) {
     }
 }
 
-// Worker: packs A, loads B directly from source (no B packing needed).
-// Requires B to be aligned such that b + kk*ldb + j_blk is 64-byte aligned.
-// If not aligned, falls back to pre-packed B.
+// Worker: processes i-tile rows.
+// direct_b=2: fused gather+compute (no packing at all!)
+// direct_b=1: pack A, load B directly
+// direct_b=0: pack A, use pre-packed B
 void amx_sgemm_worker(
     const float* a, int lda,
-    const float* b, int ldb,     // raw B pointer (or cast from packed)
+    const float* b, int ldb,
     float* c, int ldc,
     int m, int k, int n,
     int irow_start, int irow_end,
     uint8_t* a_pack_buf, uint8_t* z_buf,
-    int direct_b)  // 1 = load B directly, 0 = b is pre-packed
+    int direct_b)
 {
     const int TILE = 16;
     const int TILE_BYTES = 64;
@@ -686,6 +786,13 @@ void amx_sgemm_worker(
     for (int it = irow_start; it < irow_end; it++) {
         int i_blk = it * TILE;
         int tile_m = TILE < (m - i_blk) ? TILE : (m - i_blk);
+        
+        // Fused path: NEON gather + AMX compute interleaved (no packing!)
+        if (direct_b == 2) {
+            amx_fused_sgemm_row(a, lda, b, ldb, c, ldc,
+                i_blk, tile_m, k, n, z_buf);
+            continue;
+        }
         
         neon_pack_a_tiles(a, m, lda, it, it + 1, a_pack_buf);
         

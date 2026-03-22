@@ -146,10 +146,10 @@ mod inner {
         // Check if B can be loaded directly (requires 64-byte alignment)
         let b_aligned = (b as usize) % 64 == 0 && (ldb * 4) % 64 == 0;
         // n must be multiple of 16 for direct B (no zero-padding needed)
-        let direct_b = b_aligned && n % 16 == 0 && n <= 256;
+        let direct_b: i32 = if b_aligned && n % 16 == 0 && n <= 256 { 1 } else { 0 };
 
         if nw == 0 || n_i_tiles < 2 {
-            if !direct_b {
+            if direct_b == 0 {
                 amx_sys::amx_pack_b(b, ldb as i32, k as i32, n as i32, pool.b_pack);
             }
             let n_j_tiles = (n + 15) / 16;
@@ -159,13 +159,13 @@ mod inner {
             amx_sys::amx_set();
             amx_sys::amx_sgemm_worker(
                 a, lda as i32,
-                if direct_b { b } else { pool.b_pack as *const f32 },
-                if direct_b { ldb as i32 } else { 0 },
+                if direct_b != 0 { b } else { pool.b_pack as *const f32 },
+                if direct_b != 0 { ldb as i32 } else { 0 },
                 c, ldc as i32,
                 m as i32, k as i32, n as i32,
                 0, n_i_tiles as i32,
                 a_buf, z_buf,
-                if direct_b { 1 } else { 0 },
+                if direct_b != 0 { direct_b } else { 0 },
             );
             amx_sys::amx_clr();
             aligned_free(a_buf, MAX_K_BUF * TILE_BYTES, 128);
@@ -174,7 +174,7 @@ mod inner {
         }
 
         // Pack B on main thread (only if not using direct B)
-        if !direct_b {
+        if direct_b == 0 {
             amx_sys::amx_pack_b(b, ldb as i32, k as i32, n as i32, pool.b_pack);
         }
 
@@ -189,12 +189,12 @@ mod inner {
             let end = ((i + 1) * rows_per).min(n_i_tiles);
             *job = SgemmJob {
                 a: a as usize, lda,
-                b_packed: if direct_b { b as usize } else { pool.b_pack as usize },
+                b_packed: if direct_b != 0 { b as usize } else { pool.b_pack as usize },
                 c: c as usize, ldc,
                 m, k, n,
                 tile_start: start, tile_end: end,
                 b_ready_flag: 0,
-                b_ready_gen: if direct_b { 1 } else { 0 },
+                b_ready_gen: if direct_b != 0 { direct_b as u32 } else { 0 },
             };
         }
 

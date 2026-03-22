@@ -111,6 +111,16 @@ extern "C" {
     /// Pack B tiles into contiguous layout.
     pub fn amx_pack_b(b: *const f32, ldb: i32, k: i32, n: i32, dst: *mut u8);
 
+    /// Fused NEON gather + AMX compute: zero packing overhead.
+    pub fn amx_fused_sgemm_row(
+        a: *const f32, lda: i32,
+        b: *const f32, ldb: i32,
+        c: *mut f32, ldc: i32,
+        i_blk: i32, tile_m: i32,
+        k: i32, n: i32,
+        z_buf: *mut u8,
+    );
+
     /// Process all j-tiles for one i-tile row in a single call.
     pub fn amx_f32_tilerow(
         a_packed: *const u8, b_packed: *const u8,
