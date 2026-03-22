@@ -99,7 +99,6 @@ fn transpose_block<T: Clone + Default>(
 ) {
     const BLOCK: usize = 32;
     if rows <= BLOCK && cols <= BLOCK {
-        // Base case: small enough for L1
         for i in 0..rows {
             for j in 0..cols {
                 dst[j * dst_stride + i] = src[i * src_stride + j].clone();
@@ -126,9 +125,12 @@ fn transpose_block<T: Clone + Default>(
 // f32 matrix multiplication — scalar and AMX implementations
 // ---------------------------------------------------------------------------
 
+const TILE: usize = 16;
+const TILE_BYTES: usize = TILE * 4; // 64 bytes — one AMX register width
+
 /// Allocate `size` bytes with `align`-byte alignment (zeroed).
 fn aligned_alloc(size: usize, align: usize) -> *mut u8 {
-    if size == 0 { return align as *mut u8; } // non-null sentinel
+    if size == 0 { return align as *mut u8; }
     let layout = alloc::alloc::Layout::from_size_align(size, align)
         .expect("invalid layout");
     unsafe {
@@ -146,15 +148,148 @@ fn aligned_free(ptr: *mut u8, size: usize, align: usize) {
     unsafe { alloc::alloc::dealloc(ptr, layout); }
 }
 
+/// Pack A tiles for i-tile range [start_it..end_it).
+///
+/// For each i-tile, gathers columns of A into contiguous 64-byte vectors
+/// suitable for AMX ldy.  Layout: packed[it_local * k + kk] is a 64-byte
+/// vector of A[i_blk+0..15, kk].
+///
+/// # Safety
+///
+/// `a` must have at least `m * k` elements.
+/// `dst` must point to at least `(end_it - start_it) * k * TILE_BYTES` bytes.
+#[cfg(target_arch = "aarch64")]
+unsafe fn pack_a_tiles(
+    a: *const f32, m: usize, k: usize,
+    start_it: usize, end_it: usize,
+    dst: *mut u8,
+) {
+    for it_local in 0..(end_it - start_it) {
+        let it = start_it + it_local;
+        let i_blk = it * TILE;
+        let tile_m = TILE.min(m - i_blk);
+        for kk in 0..k {
+            let out = dst.add((it_local * k + kk) * TILE_BYTES) as *mut f32;
+            for ii in 0..tile_m {
+                out.add(ii).write(*a.add((i_blk + ii) * k + kk));
+            }
+        }
+    }
+}
+
+/// Pack B tiles for all j-tiles.
+///
+/// For each j-tile, copies contiguous rows of B into 64-byte vectors
+/// suitable for AMX ldx.  Uses `copy_nonoverlapping` for full-width copies.
+///
+/// # Safety
+///
+/// `b` must have at least `k * n` elements.
+/// `dst` must point to at least `n_j_tiles * k * TILE_BYTES` bytes.
+#[cfg(target_arch = "aarch64")]
+unsafe fn pack_b_tiles(
+    b: *const f32, k: usize, n: usize,
+    n_j_tiles: usize,
+    dst: *mut u8,
+) {
+    for jt in 0..n_j_tiles {
+        let j_blk = jt * TILE;
+        let tile_n = TILE.min(n - j_blk);
+        for kk in 0..k {
+            let out = dst.add((jt * k + kk) * TILE_BYTES);
+            let src = (b as *const u8).add((kk * n + j_blk) * 4);
+            core::ptr::copy_nonoverlapping(src, out, tile_n * 4);
+        }
+    }
+}
+
+/// KC block size for L1 cache residency.
+///
+/// Each K-block processes KC rank-1 updates.  Both A and B panels for one
+/// K-block are KC × 64 bytes each.  Total working set = 2 × KC × 64 bytes.
+/// With KC = 512: 64 KB — comfortably inside Apple Silicon L1 (192 KB).
+const KC_BLOCK: usize = 512;
+
+/// Process tiles for i-tile range [start_it..end_it), all j-tiles.
+///
+/// When k > KC_BLOCK, uses KC blocking to keep both panels in L1.
+///
+/// # Safety
+///
+/// All pointers must be valid.  `c_out` rows in [start_it*TILE .. end_it*TILE]
+/// must not be written by any other thread.
+#[cfg(target_arch = "aarch64")]
+unsafe fn compute_tile_range(
+    a_packed: *const u8, // packed A for this range (start from index 0)
+    b_packed: *const u8, // packed B for all j-tiles
+    c_out: *mut f32,
+    z_buf: *mut u8,
+    start_it: usize, end_it: usize,
+    m: usize, k: usize, n: usize,
+    n_j_tiles: usize,
+) {
+    use amx_sys::*;
+
+    let use_kc = k > KC_BLOCK;
+
+    for it_local in 0..(end_it - start_it) {
+        let it = start_it + it_local;
+        let i_blk = it * TILE;
+        let tile_m = TILE.min(m - i_blk);
+        let ap_base = a_packed.add(it_local * k * TILE_BYTES);
+
+        for jt in 0..n_j_tiles {
+            let j_blk = jt * TILE;
+            let tile_n = TILE.min(n - j_blk);
+            let bp_base = b_packed.add(jt * k * TILE_BYTES);
+
+            if use_kc {
+                // KC-blocked: split k-dimension to keep panels in L1
+                let mut first = true;
+                let mut kc_start = 0;
+                while kc_start < k {
+                    let actual_kc = KC_BLOCK.min(k - kc_start);
+                    let ap = ap_base.add(kc_start * TILE_BYTES);
+                    let bp = bp_base.add(kc_start * TILE_BYTES);
+
+                    if first {
+                        amx_f32_tile_kernel(ap, bp, z_buf, actual_kc as i32, tile_m as i32);
+                        first = false;
+                    } else {
+                        amx_f32_tile_kernel_accum(ap, bp, z_buf, actual_kc as i32, tile_m as i32);
+                    }
+                    kc_start += KC_BLOCK;
+                }
+            } else {
+                // Small k: single kernel call
+                amx_f32_tile_kernel(ap_base, bp_base, z_buf, k as i32, tile_m as i32);
+            }
+
+            // Unpack Z → output with bulk copy
+            for ii in 0..tile_m {
+                let src = z_buf.add(ii * TILE_BYTES) as *const f32;
+                let dst = c_out.add((i_blk + ii) * n + j_blk);
+                core::ptr::copy_nonoverlapping(src, dst, tile_n);
+            }
+        }
+    }
+}
+
 impl Matrix<f32> {
     /// Matrix multiplication using the best available backend.
     ///
     /// Uses multi-threaded AMX on `aarch64` with `std` feature, single-threaded
     /// AMX without `std`, or scalar fallback on non-Apple Silicon.
+    /// Falls back to scalar for very thin matrices (m < 4) where AMX wastes
+    /// 75-93% of compute on unused tile rows.
     pub fn matmul(&self, other: &Matrix<f32>) -> AmxResult<Matrix<f32>> {
+        let (m, _k) = self.dims();
+
         #[cfg(target_arch = "aarch64")]
         {
-            if amx_sys::is_amx_available() {
+            // For very thin matrices (m < 4), AMX tiles are 75-93% wasted.
+            // Scalar i,k,j loop with NEON auto-vectorization is faster.
+            if amx_sys::is_amx_available() && m >= 4 {
                 #[cfg(feature = "std")]
                 {
                     let n_threads = std::thread::available_parallelism()
@@ -168,6 +303,7 @@ impl Matrix<f32> {
                 }
             }
         }
+        let _ = m;
         self.matmul_scalar(other)
     }
 
@@ -189,7 +325,6 @@ impl Matrix<f32> {
             for kk in 0..k {
                 let a_ik = a[i * k + kk];
                 let b_row = &b[kk * n..(kk + 1) * n];
-                // Inner loop — auto-vectorisable
                 for j in 0..n {
                     c_row[j] += a_ik * b_row[j];
                 }
@@ -236,16 +371,11 @@ impl Matrix<f32> {
     /// Only available on `aarch64`.
     #[cfg(target_arch = "aarch64")]
     pub fn matmul_amx(&self, other: &Matrix<f32>) -> AmxResult<Matrix<f32>> {
-        use amx_sys::*;
-
         let (m, k) = self.dims();
         let (k2, n) = other.dims();
         if k != k2 {
             return Err(AmxError::DimensionMismatch { expected: k, got: k2 });
         }
-
-        const TILE: usize = 16;
-        const TILE_BYTES: usize = TILE * 4; // 64
 
         let a = self.as_slice();
         let b = other.as_slice();
@@ -253,87 +383,52 @@ impl Matrix<f32> {
         let n_i_tiles = (m + TILE - 1) / TILE;
         let n_j_tiles = (n + TILE - 1) / TILE;
 
-        // ── Pre-pack A (column-major within each tile row) ───────────
-        let a_pack_len = n_i_tiles * k;
-        let a_packed = aligned_alloc(a_pack_len * TILE_BYTES, 64);
-        for it in 0..n_i_tiles {
-            let i_blk = it * TILE;
-            let tile_m = TILE.min(m - i_blk);
-            for kk in 0..k {
-                let dst = unsafe { a_packed.add((it * k + kk) * TILE_BYTES) as *mut f32 };
-                for ii in 0..tile_m {
-                    unsafe { dst.add(ii).write(a[(i_blk + ii) * k + kk]); }
-                }
-            }
-        }
+        // ── Pre-pack A and B ─────────────────────────────────────────
+        let a_pack_size = n_i_tiles * k * TILE_BYTES;
+        let a_packed = aligned_alloc(a_pack_size, 64);
+        unsafe { pack_a_tiles(a.as_ptr(), m, k, 0, n_i_tiles, a_packed); }
 
-        // ── Pre-pack B (row-major within each tile column) ───────────
-        let b_pack_len = n_j_tiles * k;
-        let b_packed = aligned_alloc(b_pack_len * TILE_BYTES, 64);
-        for jt in 0..n_j_tiles {
-            let j_blk = jt * TILE;
-            let tile_n = TILE.min(n - j_blk);
-            for kk in 0..k {
-                let dst = unsafe { b_packed.add((jt * k + kk) * TILE_BYTES) };
-                let src = b[kk * n + j_blk..].as_ptr() as *const u8;
-                unsafe { core::ptr::copy_nonoverlapping(src, dst, tile_n * 4); }
-            }
-        }
+        let b_pack_size = n_j_tiles * k * TILE_BYTES;
+        let b_packed = aligned_alloc(b_pack_size, 64);
+        unsafe { pack_b_tiles(b.as_ptr(), k, n, n_j_tiles, b_packed); }
 
-        // ── Tile loop with C micro-kernel ────────────────────────────
+        // ── Tile loop ────────────────────────────────────────────────
         let mut c_data = vec![0.0f32; m * n];
-
-        // Tile store buffer: 16 rows × 64 bytes = 1024 bytes
         let z_buf = aligned_alloc(TILE * TILE_BYTES, 64);
 
         unsafe {
-            amx_set();
-
-            // Process in j-major order: B panel stays warm in cache
-            // across all i-tiles that share the same j-tile.
-            for jt in 0..n_j_tiles {
-                let j_blk = jt * TILE;
-                let tile_n = TILE.min(n - j_blk);
-                let bp = b_packed.add(jt * k * TILE_BYTES);
-
-                for it in 0..n_i_tiles {
-                    let i_blk = it * TILE;
-                    let tile_m = TILE.min(m - i_blk);
-                    let ap = a_packed.add(it * k * TILE_BYTES);
-
-                    amx_f32_tile_kernel(ap, bp, z_buf, k as i32, tile_m as i32);
-
-                    // Unpack Z store buffer → output matrix
-                    // Use copy_nonoverlapping for bandwidth
-                    for ii in 0..tile_m {
-                        let src = z_buf.add(ii * TILE_BYTES) as *const f32;
-                        let dst = c_data.as_mut_ptr().add((i_blk + ii) * n + j_blk);
-                        core::ptr::copy_nonoverlapping(src, dst, tile_n);
-                    }
-                }
-            }
-
-            amx_clr();
+            amx_sys::amx_set();
+            compute_tile_range(
+                a_packed, b_packed, c_data.as_mut_ptr(), z_buf,
+                0, n_i_tiles, m, k, n, n_j_tiles,
+            );
+            amx_sys::amx_clr();
         }
 
-        aligned_free(a_packed, a_pack_len * TILE_BYTES, 64);
-        aligned_free(b_packed, b_pack_len * TILE_BYTES, 64);
+        aligned_free(a_packed, a_pack_size, 64);
+        aligned_free(b_packed, b_pack_size, 64);
         aligned_free(z_buf, TILE * TILE_BYTES, 64);
 
         Matrix::from_data(c_data, m, n)
     }
 
-    /// Multi-threaded AMX matmul — 2D tile distribution across threads.
+    /// Multi-threaded AMX matmul with parallel packing.
     ///
-    /// Pre-packs A and B globally (shared read-only), then distributes
-    /// (it, jt) tile pairs evenly across threads.  Each thread gets its
-    /// own AMX context and Z buffer.  This distributes work well even
-    /// for very rectangular matrices (e.g. 32×4096 × 4096×4096).
+    /// Distributes i-tile rows across workers.  Each worker:
+    ///   1. Packs its own A tiles (parallel — eliminates sequential bottleneck)
+    ///   2. Computes all j-tiles for its i-tiles using AMX
     ///
-    /// Falls back to single-threaded `matmul_amx` when `n_threads <= 1` or
-    /// the matrix is too small to benefit from parallelism.
+    /// B is pre-packed once (fast sequential reads) and shared read-only.
+    ///
+    /// When the `parallel` feature is enabled (default), uses rayon's
+    /// persistent work-stealing thread pool for near-zero spawn overhead.
+    /// Without rayon, falls back to `std::thread::scope`.
+    ///
+    /// Falls back to single-threaded when the matrix is too small for the
+    /// overhead to pay off.
     #[cfg(all(feature = "std", target_arch = "aarch64"))]
     pub fn matmul_amx_parallel(&self, other: &Matrix<f32>, n_threads: usize) -> AmxResult<Matrix<f32>> {
+        #[allow(unused_imports)]
         use amx_sys::*;
 
         let (m, k) = self.dims();
@@ -342,107 +437,155 @@ impl Matrix<f32> {
             return Err(AmxError::DimensionMismatch { expected: k, got: k2 });
         }
 
-        const TILE: usize = 16;
-        const TILE_BYTES: usize = TILE * 4;
+        let n_i_tiles = (m + TILE - 1) / TILE;
+        let n_j_tiles = (n + TILE - 1) / TILE;
+
+        // Minimum FLOPs per thread to justify threading overhead.
+        // With rayon (~1µs spawn), threshold is lower.
+        // With std::thread (~20µs spawn), threshold is higher.
+        let total_flops = 2.0 * m as f64 * k as f64 * n as f64;
+        let n_threads = n_threads.max(1);
+
+        #[cfg(feature = "parallel")]
+        let min_flops_per_thread = 500_000.0; // rayon: low overhead
+        #[cfg(not(feature = "parallel"))]
+        let min_flops_per_thread = 10_000_000.0; // std::thread: high overhead
+
+        if n_threads <= 1
+            || n_i_tiles < 2
+            || total_flops / (n_threads as f64) < min_flops_per_thread
+        {
+            return self.matmul_amx(other);
+        }
 
         let a = self.as_slice();
         let b = other.as_slice();
 
-        let n_i_tiles = (m + TILE - 1) / TILE;
-        let n_j_tiles = (n + TILE - 1) / TILE;
-        let total_tiles = n_i_tiles * n_j_tiles;
+        // ── Pre-pack B globally (fast — sequential source reads) ─────
+        let b_pack_size = n_j_tiles * k * TILE_BYTES;
+        let b_packed = aligned_alloc(b_pack_size, 64);
+        unsafe { pack_b_tiles(b.as_ptr(), k, n, n_j_tiles, b_packed); }
 
-        let n_threads = n_threads.max(1);
-        if n_threads <= 1 || total_tiles < n_threads * 2 {
-            return self.matmul_amx(other);
-        }
-
-        // ── Pre-pack A globally (shared read-only) ──────────────────
-        let a_pack_len = n_i_tiles * k;
-        let a_packed = aligned_alloc(a_pack_len * TILE_BYTES, 64);
-        for it in 0..n_i_tiles {
-            let i_blk = it * TILE;
-            let tile_m = TILE.min(m - i_blk);
-            for kk in 0..k {
-                let dst = unsafe { a_packed.add((it * k + kk) * TILE_BYTES) as *mut f32 };
-                for ii in 0..tile_m {
-                    unsafe { dst.add(ii).write(a[(i_blk + ii) * k + kk]); }
-                }
-            }
-        }
-
-        // ── Pre-pack B globally (shared read-only) ──────────────────
-        let b_pack_len = n_j_tiles * k;
-        let b_packed = aligned_alloc(b_pack_len * TILE_BYTES, 64);
-        for jt in 0..n_j_tiles {
-            let j_blk = jt * TILE;
-            let tile_n = TILE.min(n - j_blk);
-            for kk in 0..k {
-                let dst = unsafe { b_packed.add((jt * k + kk) * TILE_BYTES) };
-                let src = b[kk * n + j_blk..].as_ptr() as *const u8;
-                unsafe { core::ptr::copy_nonoverlapping(src, dst, tile_n * 4); }
-            }
-        }
+        // ── Pre-allocate z_bufs for each thread ──────────────────────
+        let actual_threads = n_threads.min(n_i_tiles);
+        let z_bufs: Vec<*mut u8> = (0..actual_threads)
+            .map(|_| aligned_alloc(TILE * TILE_BYTES, 64))
+            .collect();
 
         let mut c_data = vec![0.0f32; m * n];
 
-        let c_send = SendPtr(c_data.as_mut_ptr());
-        let a_send = SendPtr(a_packed);
-        let b_send = SendPtr(b_packed);
+        let c_ptr = c_data.as_mut_ptr();
+        let a_ptr = a.as_ptr();
+        let b_ptr = b_packed;
+        let i_tiles_per_thread = (n_i_tiles + actual_threads - 1) / actual_threads;
 
-        std::thread::scope(|scope| {
-            let tiles_per_thread = (total_tiles + n_threads - 1) / n_threads;
+        // Dispatch workers using the best available parallelism backend
+        #[cfg(feature = "parallel")]
+        {
+            // Wrap all raw-pointer state into a Send struct for rayon
+            struct TileWork {
+                c_ptr: SendPtr<f32>,
+                a_ptr: SendPtr<f32>,
+                b_ptr: SendPtr<u8>,
+                z_buf: SendPtr<u8>,
+                start_it: usize,
+                end_it: usize,
+                m: usize,
+                k: usize,
+                n: usize,
+                n_j_tiles: usize,
+            }
+            unsafe impl Send for TileWork {}
 
-            for tid in 0..n_threads {
-                let start_tile = tid * tiles_per_thread;
-                let end_tile = (start_tile + tiles_per_thread).min(total_tiles);
-                if start_tile >= end_tile { continue; }
-
-                let c_s = c_send;
-                let a_s = a_send;
-                let b_s = b_send;
-
-                let work = unsafe { AssertSend(move || {
-                    let c_out = c_s.0;
-                    let a_pack = a_s.0;
-                    let b_pack = b_s.0;
-
-                    let z_buf = aligned_alloc(TILE * TILE_BYTES, 64);
+            impl TileWork {
+                unsafe fn run(&self) {
+                    use amx_sys::*;
+                    let my_tiles = self.end_it - self.start_it;
+                    let a_pack_size = my_tiles * self.k * TILE_BYTES;
+                    let a_packed = aligned_alloc(a_pack_size, 64);
+                    pack_a_tiles(
+                        self.a_ptr.0 as *const f32, self.m, self.k,
+                        self.start_it, self.end_it, a_packed,
+                    );
 
                     amx_set();
-
-                    for tile_idx in start_tile..end_tile {
-                        // 2D tile index: column-major order for B-panel reuse
-                        let jt = tile_idx / n_i_tiles;
-                        let it = tile_idx % n_i_tiles;
-
-                        let i_blk = it * TILE;
-                        let j_blk = jt * TILE;
-                        let tile_m = TILE.min(m - i_blk);
-                        let tile_n = TILE.min(n - j_blk);
-
-                        let ap = a_pack.add(it * k * TILE_BYTES);
-                        let bp = b_pack.add(jt * k * TILE_BYTES);
-
-                        amx_f32_tile_kernel(ap, bp, z_buf, k as i32, tile_m as i32);
-
-                        for ii in 0..tile_m {
-                            let src = z_buf.add(ii * TILE_BYTES) as *const f32;
-                            let dst = c_out.add((i_blk + ii) * n + j_blk);
-                            core::ptr::copy_nonoverlapping(src, dst, tile_n);
-                        }
-                    }
-
+                    compute_tile_range(
+                        a_packed, self.b_ptr.0 as *const u8,
+                        self.c_ptr.0, self.z_buf.0,
+                        self.start_it, self.end_it,
+                        self.m, self.k, self.n, self.n_j_tiles,
+                    );
                     amx_clr();
-                    aligned_free(z_buf, TILE * TILE_BYTES, 64);
-                }) };
 
-                scope.spawn(|| work.run());
+                    aligned_free(a_packed, a_pack_size, 64);
+                }
             }
-        });
 
-        aligned_free(a_packed, a_pack_len * TILE_BYTES, 64);
-        aligned_free(b_packed, b_pack_len * TILE_BYTES, 64);
+            let works: Vec<TileWork> = (0..actual_threads)
+                .filter_map(|tid| {
+                    let start_it = tid * i_tiles_per_thread;
+                    let end_it = (start_it + i_tiles_per_thread).min(n_i_tiles);
+                    if start_it >= end_it { return None; }
+                    Some(TileWork {
+                        c_ptr: SendPtr(c_ptr),
+                        a_ptr: SendPtr(a_ptr as *mut f32),
+                        b_ptr: SendPtr(b_ptr),
+                        z_buf: SendPtr(z_bufs[tid]),
+                        start_it, end_it, m, k, n, n_j_tiles,
+                    })
+                })
+                .collect();
+
+            rayon::scope(|s| {
+                for work in &works {
+                    s.spawn(move |_| unsafe { work.run() });
+                }
+            });
+        }
+
+        #[cfg(not(feature = "parallel"))]
+        {
+            let c_send = SendPtr(c_ptr);
+            let a_send = SendPtr(a_ptr as *mut f32);
+            let b_send = SendPtr(b_ptr);
+
+            std::thread::scope(|scope| {
+                for tid in 0..actual_threads {
+                    let c_s = c_send;
+                    let a_s = a_send;
+                    let b_s = b_send;
+                    let z_buf = z_bufs[tid];
+                    let start_it = tid * i_tiles_per_thread;
+                    let end_it = (start_it + i_tiles_per_thread).min(n_i_tiles);
+
+                    if start_it >= end_it { continue; }
+
+                    let work = unsafe { AssertSend(move || {
+                        let my_tiles = end_it - start_it;
+                        let a_pack_size = my_tiles * k * TILE_BYTES;
+                        let a_packed = aligned_alloc(a_pack_size, 64);
+                        pack_a_tiles(a_s.0 as *const f32, m, k, start_it, end_it, a_packed);
+
+                        amx_set();
+                        compute_tile_range(
+                            a_packed, b_s.0 as *const u8, c_s.0, z_buf,
+                            start_it, end_it, m, k, n, n_j_tiles,
+                        );
+                        amx_clr();
+
+                        aligned_free(a_packed, a_pack_size, 64);
+                    }) };
+
+                    scope.spawn(|| work.run());
+                }
+            });
+        }
+
+        // Cleanup
+        for &z in &z_bufs {
+            aligned_free(z, TILE * TILE_BYTES, 64);
+        }
+        aligned_free(b_packed, b_pack_size, 64);
 
         Matrix::from_data(c_data, m, n)
     }
@@ -456,11 +599,11 @@ unsafe impl<T> Sync for SendPtr<T> {}
 
 /// Assert a closure is Send even if it captures raw pointers.
 /// Safety: caller must ensure the captured data is valid and non-overlapping.
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(feature = "parallel")))]
 struct AssertSend<F: FnOnce()>(F);
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(feature = "parallel")))]
 unsafe impl<F: FnOnce()> Send for AssertSend<F> {}
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", not(feature = "parallel")))]
 impl<F: FnOnce()> AssertSend<F> {
     fn run(self) { (self.0)() }
 }
@@ -535,7 +678,6 @@ mod tests {
 
     #[test]
     fn test_matmul_large_tiled() {
-        // 20×17 × 17×19 — exercises partial edge tiles (>16)
         let m = 20;
         let k = 17;
         let n = 19;
@@ -578,7 +720,6 @@ mod tests {
 
     #[test]
     fn test_matmul_f64_precision() {
-        // Test that f64 accumulation is more precise than f32
         let m = 64;
         let k = 256;
         let n = 64;
@@ -596,11 +737,8 @@ mod tests {
         let c_f64 = a.matmul_f64(&b).unwrap();
         let c_f32 = a.matmul_scalar(&b).unwrap();
 
-        // Both should produce finite results
         assert!(c_f64.as_slice().iter().all(|v| v.is_finite()));
         assert!(c_f32.as_slice().iter().all(|v| v.is_finite()));
-
-        // f64 result should exist (basic sanity)
         assert_eq!(c_f64.dims(), (m, n));
     }
 

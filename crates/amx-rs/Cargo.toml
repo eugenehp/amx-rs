@@ -10,8 +10,9 @@ keywords = ["amx", "matrix", "vector", "math", "simd"]
 categories = ["algorithms", "mathematics", "no-std"]
 
 [features]
-default = ["std"]
+default = ["std", "parallel"]
 std = []
+parallel = ["std", "rayon"]
 
 [lib]
 name = "amx"
@@ -19,6 +20,7 @@ path = "src/lib.rs"
 
 [dependencies]
 amx-sys = { path = "../amx-sys", version = "0.0.3" }
+rayon = { version = "1", optional = true }
 
 [dev-dependencies]
 amx-sys = { path = "../amx-sys", version = "0.0.3" }
