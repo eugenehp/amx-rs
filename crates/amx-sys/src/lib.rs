@@ -111,6 +111,16 @@ extern "C" {
     /// Pack B tiles into contiguous layout.
     pub fn amx_pack_b(b: *const f32, ldb: i32, k: i32, n: i32, dst: *mut u8);
 
+    /// Zero-pack sgemm: A in column-major, B in row-major, no packing.
+    /// Computes C += A × B where A is column-major (lda = num_rows).
+    pub fn amx_sgemm_at_b(
+        a: *const f32, lda: i32,  // A column-major
+        b: *const f32, ldb: i32,  // B row-major
+        c: *mut f32, ldc: i32,
+        m: i32, k: i32, n: i32,
+        z_buf: *mut u8,
+    );
+
     /// Fused NEON gather + AMX compute: zero packing overhead.
     pub fn amx_fused_sgemm_row(
         a: *const f32, lda: i32,

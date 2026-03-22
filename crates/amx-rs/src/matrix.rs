@@ -486,6 +486,49 @@ impl Matrix<f32> {
         Matrix::from_data(c_data, m, n)
     }
 
+    /// Zero-copy AMX matmul: transposes A to column-major, then
+    /// loads A columns directly via ldy and B rows via ldx.
+    /// No column-gather packing needed.
+    #[cfg(target_arch = "aarch64")]
+    pub fn matmul_zerocopy(&self, other: &Matrix<f32>) -> AmxResult<Matrix<f32>> {
+        let (m, k) = self.dims();
+        let (k2, n) = other.dims();
+        if k != k2 {
+            return Err(AmxError::DimensionMismatch { expected: k, got: k2 });
+        }
+        let a = self.as_slice();
+        let b = other.as_slice();
+
+        // Transpose A to column-major (aligned to 64 bytes per column)
+        let m_pad = (m + 15) & !15;
+        let at_sz = m_pad * k;
+        let at_ptr = aligned_alloc(at_sz * 4, 128);
+        let at = unsafe { core::slice::from_raw_parts_mut(at_ptr as *mut f32, at_sz) };
+        for kk in 0..k {
+            for i in 0..m { at[i + kk * m_pad] = a[i * k + kk]; }
+            for i in m..m_pad { at[i + kk * m_pad] = 0.0; }
+        }
+
+        let mut c_data = vec![0.0f32; m * n];
+        let z_buf = aligned_alloc(((n+15)/16) * 16 * TILE_BYTES, 128);
+
+        unsafe {
+            amx_sys::amx_set();
+            amx_sys::amx_sgemm_at_b(
+                at.as_ptr(), m_pad as i32,
+                b.as_ptr(), n as i32,
+                c_data.as_mut_ptr(), n as i32,
+                m as i32, k as i32, n as i32,
+                z_buf,
+            );
+            amx_sys::amx_clr();
+        }
+
+        aligned_free(at_ptr, at_sz * 4, 128);
+        aligned_free(z_buf, ((n+15)/16) * 16 * TILE_BYTES, 128);
+        Matrix::from_data(c_data, m, n)
+    }
+
     /// AMX matmul using a persistent thread pool.
     ///
     /// Workers do their own packing + compute in a single C call.

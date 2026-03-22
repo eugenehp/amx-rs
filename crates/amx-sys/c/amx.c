@@ -584,6 +584,84 @@ void amx_f32_tile_loop(
 // Forward declarations
 void neon_pack_a_tiles(const float* a, int m, int k, int start_it, int end_it, uint8_t* dst);
 
+// ── Zero-pack sgemm: A rows loaded via ldy, B rows via ldx ──────────
+//
+// Computes C[m×n] += A[m×k]^T × B[k×n] using:
+//   Y ← A row (contiguous, no gather!)
+//   X ← B row (contiguous, direct load!)
+//   Z += Y ⊗ X (outer product)
+//
+// Result: Z[i][j] = Σ_k A[k,i] × B[k,j] = (A^T × B)[i][j]
+// So this computes A_transposed × B. Caller handles transpose.
+//
+// ZERO packing overhead — A and B loaded directly from source.
+void amx_sgemm_at_b(
+    const float* a, int lda,   // A in COLUMN-MAJOR: A[i,k] = a[i + k*lda]
+    const float* b, int ldb,   // B in ROW-MAJOR: B[k,j] = b[k*ldb + j]
+    float* c, int ldc,         // C[i,j] = c[i*ldc + j], ROW-MAJOR
+    int m, int k, int n,       // C = A^T[m×k] × B[k×n]
+    uint8_t* z_buf)
+{
+    const int TILE = 16;
+    const int TILE_BYTES = 64;
+    int n_i_tiles = (m + TILE - 1) / TILE;
+    int n_j_tiles = (n + TILE - 1) / TILE;
+    
+    for (int it = 0; it < n_i_tiles; it++) {
+        int i_blk = it * TILE;
+        int tile_m = TILE < (m - i_blk) ? TILE : (m - i_blk);
+        
+        for (int jt = 0; jt < n_j_tiles; jt++) {
+            int j_blk = jt * TILE;
+            int tile_n = TILE < (n - j_blk) ? TILE : (n - j_blk);
+            
+            // Zero Z
+            static const uint8_t zeros[64] __attribute__((aligned(128))) = {0};
+            uint64_t zbase = (uint64_t)zeros;
+            for (int r = 0; r < 16; r++)
+                AMX_OP_GPR(4, zbase | ((uint64_t)(r*4) << 56));
+            
+            // Accumulate: for each k, load A row (as Y) and B row (as X)
+            // A is column-major: A column i = A[i + k*lda] for k=0..K-1
+            // So A "row k" in column-major = a[i_blk + k*lda] for 16 elements
+            // This is contiguous if we offset by i_blk!
+            #define FMA32_Y(row) ((uint64_t)(row) << 6)
+            int kk = 0;
+            for (; kk + 3 < k; kk += 4) {
+                // Load 4 "rows" of A (column-major) into Y[0..3]
+                // A[i_blk..i_blk+15, kk] = a[i_blk + kk*lda] (16 contiguous f32)
+                AMX_OP_GPR(1, (uint64_t)(a + i_blk + (kk+0)*lda) | (0ULL << 56));
+                AMX_OP_GPR(1, (uint64_t)(a + i_blk + (kk+1)*lda) | (1ULL << 56));
+                AMX_OP_GPR(1, (uint64_t)(a + i_blk + (kk+2)*lda) | (2ULL << 56));
+                AMX_OP_GPR(1, (uint64_t)(a + i_blk + (kk+3)*lda) | (3ULL << 56));
+                
+                // Load B rows into X and fma32
+                AMX_OP_GPR(0, (uint64_t)(b + (kk+0)*ldb + j_blk));
+                AMX_OP_GPR(12, FMA32_Y(0));
+                AMX_OP_GPR(0, (uint64_t)(b + (kk+1)*ldb + j_blk));
+                AMX_OP_GPR(12, FMA32_Y(1));
+                AMX_OP_GPR(0, (uint64_t)(b + (kk+2)*ldb + j_blk));
+                AMX_OP_GPR(12, FMA32_Y(2));
+                AMX_OP_GPR(0, (uint64_t)(b + (kk+3)*ldb + j_blk));
+                AMX_OP_GPR(12, FMA32_Y(3));
+            }
+            for (; kk < k; kk++) {
+                AMX_OP_GPR(1, (uint64_t)(a + i_blk + kk*lda));
+                AMX_OP_GPR(0, (uint64_t)(b + kk*ldb + j_blk));
+                AMX_OP_GPR(12, 0);
+            }
+            #undef FMA32_Y
+            
+            // Store Z → C directly (C was pre-zeroed by caller)
+            for (int r = 0; r < tile_m; r++) {
+                float __attribute__((aligned(64))) row_buf[16];
+                AMX_OP_GPR(5, ((uint64_t)row_buf) | ((uint64_t)(r*4) << 56));
+                __builtin_memcpy(c + (i_blk + r) * ldc + j_blk, row_buf, tile_n * 4);
+            }
+        }
+    }
+}
+
 // ── Fused gather+compute kernel: NEON gather interleaved with AMX ────
 //
 // Instead of: pack_all_A → compute_all_tiles (packing is 44% overhead)
@@ -767,7 +845,8 @@ void amx_pack_b(const float* b, int ldb, int k, int n, uint8_t* dst) {
 }
 
 // Worker: processes i-tile rows.
-// direct_b=2: fused gather+compute (no packing at all!)
+// direct_b=3: zero-copy (A is column-major, B direct load, NO packing at all)
+// direct_b=2: fused gather+compute (unused)
 // direct_b=1: pack A, load B directly
 // direct_b=0: pack A, use pre-packed B
 void amx_sgemm_worker(
@@ -787,7 +866,59 @@ void amx_sgemm_worker(
         int i_blk = it * TILE;
         int tile_m = TILE < (m - i_blk) ? TILE : (m - i_blk);
         
-        // Fused path: NEON gather + AMX compute interleaved (no packing!)
+        // Zero-copy path: A is column-major, both A and B loaded directly
+        if (direct_b == 3) {
+            int n_j_tiles_local = (n + TILE - 1) / TILE;
+            for (int jt = 0; jt < n_j_tiles_local; jt++) {
+                int j_blk = jt * TILE;
+                int tile_n = TILE < (n - j_blk) ? TILE : (n - j_blk);
+                
+                // Zero Z
+                static const uint8_t zz[64] __attribute__((aligned(128))) = {0};
+                for (int r = 0; r < 16; r++)
+                    AMX_OP_GPR(4, (uint64_t)zz | ((uint64_t)(r*4) << 56));
+                
+                #define FMA32_Y_ZC(row) ((uint64_t)(row) << 6)
+                int kk = 0;
+                for (; kk + 3 < k; kk += 4) {
+                    // A column-major: a[i_blk + kk*lda] = 16 contiguous floats
+                    AMX_OP_GPR(1, (uint64_t)(a + i_blk + (kk+0)*lda) | (0ULL << 56));
+                    AMX_OP_GPR(1, (uint64_t)(a + i_blk + (kk+1)*lda) | (1ULL << 56));
+                    AMX_OP_GPR(1, (uint64_t)(a + i_blk + (kk+2)*lda) | (2ULL << 56));
+                    AMX_OP_GPR(1, (uint64_t)(a + i_blk + (kk+3)*lda) | (3ULL << 56));
+                    AMX_OP_GPR(0, (uint64_t)(b + (kk+0)*ldb + j_blk));
+                    AMX_OP_GPR(12, FMA32_Y_ZC(0));
+                    AMX_OP_GPR(0, (uint64_t)(b + (kk+1)*ldb + j_blk));
+                    AMX_OP_GPR(12, FMA32_Y_ZC(1));
+                    AMX_OP_GPR(0, (uint64_t)(b + (kk+2)*ldb + j_blk));
+                    AMX_OP_GPR(12, FMA32_Y_ZC(2));
+                    AMX_OP_GPR(0, (uint64_t)(b + (kk+3)*ldb + j_blk));
+                    AMX_OP_GPR(12, FMA32_Y_ZC(3));
+                }
+                for (; kk < k; kk++) {
+                    AMX_OP_GPR(1, (uint64_t)(a + i_blk + kk*lda));
+                    AMX_OP_GPR(0, (uint64_t)(b + kk*ldb + j_blk));
+                    AMX_OP_GPR(12, 0);
+                }
+                #undef FMA32_Y_ZC
+                
+                uint8_t* z_dst = z_buf + jt * tile_m * TILE_BYTES;
+                for (int r = 0; r < tile_m; r++)
+                    AMX_OP_GPR(5, ((uint64_t)(z_dst + r*64)) | ((uint64_t)(r*4) << 56));
+            }
+            // Bulk copy z_buf → C
+            int n_j_tiles2 = (n + TILE - 1) / TILE;
+            for (int ii = 0; ii < tile_m; ii++)
+                for (int jt = 0; jt < n_j_tiles2; jt++) {
+                    int j_blk = jt * TILE;
+                    int tile_n = TILE < (n - j_blk) ? TILE : (n - j_blk);
+                    __builtin_memcpy(c + (i_blk+ii)*ldc + j_blk,
+                        z_buf + (jt*tile_m + ii)*TILE_BYTES, tile_n*4);
+                }
+            continue;
+        }
+        
+        // Fused path (unused)
         if (direct_b == 2) {
             amx_fused_sgemm_row(a, lda, b, ldb, c, ldc,
                 i_blk, tile_m, k, n, z_buf);
