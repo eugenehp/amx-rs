@@ -30,14 +30,17 @@ mod inner {
         b_packed: usize,
         c: usize, ldc: usize,
         m: usize, k: usize, n: usize,
-        tile_start: usize, tile_end: usize, // i-row range
+        tile_start: usize, tile_end: usize,
+        b_ready_flag: usize, // pointer to b_ready AtomicU32
+        b_ready_gen: u32,    // generation to wait for
     }
 
     struct AmxPool {
         slots: Vec<WorkerSlot>,
         n_workers: usize,
         generation: AtomicU32,
-        b_pack: *mut u8,     // shared B packing buffer
+        b_ready: AtomicU32,  // bumped after B is packed
+        b_pack: *mut u8,
         b_pack_size: usize,
     }
 
@@ -67,6 +70,7 @@ mod inner {
                 let pool = Box::leak(Box::new(AmxPool {
                     slots, n_workers,
                     generation: AtomicU32::new(0),
+                    b_ready: AtomicU32::new(0),
                     b_pack: aligned_alloc(b_pack_size, 128),
                     b_pack_size,
                 }));
@@ -114,6 +118,8 @@ mod inner {
                         job.m as i32, job.k as i32, job.n as i32,
                         job.tile_start as i32, job.tile_end as i32,
                         slot.a_pack, slot.z_buf,
+                        job.b_ready_flag as *const u32,
+                        job.b_ready_gen,
                     );
                     amx_sys::amx_clr();
                 }
@@ -134,12 +140,12 @@ mod inner {
         let pool = get_pool();
         let nw = pool.n_workers;
 
-        // Pack B ONCE on main thread
-        amx_sys::amx_pack_b(b, ldb as i32, k as i32, n as i32, pool.b_pack);
-
         if nw == 0 || n_i_tiles < 2 {
+            amx_sys::amx_pack_b(b, ldb as i32, k as i32, n as i32, pool.b_pack);
             let a_buf = aligned_alloc(MAX_K_BUF * TILE_BYTES, 128);
             let z_buf = aligned_alloc(16 * TILE_BYTES, 128);
+            let b_ready_gen = pool.b_ready.load(Ordering::Relaxed);
+            pool.b_ready.store(b_ready_gen + 1, Ordering::Release);
             amx_sys::amx_set();
             amx_sys::amx_sgemm_worker(
                 a, lda as i32, pool.b_pack,
@@ -147,6 +153,8 @@ mod inner {
                 m as i32, k as i32, n as i32,
                 0, n_i_tiles as i32,
                 a_buf, z_buf,
+                &pool.b_ready as *const AtomicU32 as *const u32,
+                b_ready_gen + 1,
             );
             amx_sys::amx_clr();
             aligned_free(a_buf, MAX_K_BUF * TILE_BYTES, 128);
@@ -154,15 +162,11 @@ mod inner {
             return;
         }
 
-        // Distribution strategy:
-        // For small matrices (≤ 128 i-tiles per worker): distribute by i-rows.
-        //   Each worker packs A once per row + processes all j-tiles.
-        //   Good A-pack amortization, low contention.
-        // For large matrices: more workers get diminishing returns from
-        //   redundant B packing in each worker. Cap at a sweet spot.
         let active = nw.min(n_i_tiles);
         let rows_per = (n_i_tiles + active - 1) / active;
+        let b_ready_gen = pool.b_ready.load(Ordering::Relaxed) + 1;
 
+        // Write jobs to workers (BEFORE packing B)
         for i in 0..nw {
             let slot = &pool.slots[i];
             let job = &mut *slot.job.get();
@@ -175,14 +179,24 @@ mod inner {
                     c: c as usize, ldc,
                     m, k, n,
                     tile_start: start, tile_end: end,
+                    b_ready_flag: &pool.b_ready as *const AtomicU32 as usize,
+                    b_ready_gen,
                 };
             } else {
                 *job = core::mem::zeroed();
             }
         }
 
+        // Wake workers — they start packing A immediately
         let gen = pool.generation.fetch_add(1, Ordering::Release) + 1;
 
+        // Main thread packs B IN PARALLEL with workers' A packing
+        amx_sys::amx_pack_b(b, ldb as i32, k as i32, n as i32, pool.b_pack);
+        
+        // Signal B is ready — workers waiting on this will proceed
+        pool.b_ready.store(b_ready_gen, Ordering::Release);
+
+        // Wait for workers to finish
         for i in 0..nw {
             let slot = &pool.slots[i];
             loop {

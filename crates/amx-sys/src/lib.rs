@@ -119,14 +119,15 @@ extern "C" {
         tile_m: i32, n_j_tiles: i32,
     );
 
-    /// Worker: uses shared pre-packed B, packs only own A tiles.
+    /// Worker: packs A, waits for B ready signal, then computes.
     pub fn amx_sgemm_worker(
         a: *const f32, lda: i32,
         b_packed: *const u8,
         c: *mut f32, ldc: i32,
         m: i32, k: i32, n: i32,
-        tile_start: i32, tile_end: i32,
+        irow_start: i32, irow_end: i32,
         a_pack_buf: *mut u8, z_buf: *mut u8,
+        b_ready_flag: *const u32, b_ready_gen: u32,
     );
 
     /// Full tile loop: processes tile range [start..end) in a single C call.

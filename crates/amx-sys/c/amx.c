@@ -645,16 +645,17 @@ void amx_pack_b(const float* b, int ldb, int k, int n, uint8_t* dst) {
     }
 }
 
-// Worker: uses shared pre-packed B, packs own A, processes i-tile rows.
-// tile_start/tile_end are i-tile ROW indices (not flat tile indices).
-// Each i-row processes ALL j-tiles via amx_f32_tilerow.
+// Worker: packs A, waits for shared B, then computes.
+// b_ready_flag: pointer to atomic uint32 that main thread bumps after B packing.
+// b_ready_gen: the generation value to wait for.
 void amx_sgemm_worker(
     const float* a, int lda,
     const uint8_t* b_packed,
     float* c, int ldc,
     int m, int k, int n,
     int irow_start, int irow_end,
-    uint8_t* a_pack_buf, uint8_t* z_buf)
+    uint8_t* a_pack_buf, uint8_t* z_buf,
+    const volatile uint32_t* b_ready_flag, uint32_t b_ready_gen)
 {
     const int TILE = 16;
     const int TILE_BYTES = 64;
@@ -664,8 +665,14 @@ void amx_sgemm_worker(
         int i_blk = it * TILE;
         int tile_m = TILE < (m - i_blk) ? TILE : (m - i_blk);
         
-        // Pack A for this i-tile row
+        // Pack A for this i-tile row (overlaps with main thread's B packing)
         neon_pack_a_tiles(a, m, lda, it, it + 1, a_pack_buf);
+        
+        // Wait for B to be ready (first iteration only)
+        if (it == irow_start) {
+            while (__atomic_load_n(b_ready_flag, __ATOMIC_ACQUIRE) < b_ready_gen)
+                __asm__ volatile("yield");
+        }
         
         // Process all j-tiles for this row
         amx_f32_tilerow(a_pack_buf, b_packed,
