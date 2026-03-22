@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 680" width="100%" height="auto">
 <rect width="1000" height="680" fill="#ffffff"/>
 <text x="24" y="32" font-size="20" font-family="Menlo,monospace" fill="#0f172a">Square Matmul GFLOPS — Scalar vs AMX vs Accelerate</text>
-<text x="24" y="52" font-size="11" font-family="Menlo,monospace" fill="#64748b">Apple M4 Pro (Virtual) · f32 · higher is better</text>
+<text x="24" y="52" font-size="11" font-family="Menlo,monospace" fill="#64748b">Apple M1 (Virtual) · f32 · higher is better</text>
 <rect x="200" y="54" width="10" height="10" rx="2" fill="#6366f1"/>
 <text x="214" y="63" font-size="11" font-family="Menlo,monospace" fill="#334155">Scalar Rust</text>
 <rect x="380" y="54" width="10" height="10" rx="2" fill="#f59e0b"/>
@@ -11,66 +11,66 @@
 <rect x="740" y="54" width="10" height="10" rx="2" fill="#10b981"/>
 <text x="754" y="63" font-size="11" font-family="Menlo,monospace" fill="#334155">Accelerate</text>
 <text x="12" y="108" font-size="11" font-family="Menlo,monospace" fill="#111827">8x8x8</text>
-<rect x="200" y="70" width="1.5" height="14" rx="3" fill="#6366f1"/>
-<text x="206.5" y="81" font-size="10" font-family="Menlo,monospace" fill="#334155">3.5 GFLOPS</text>
-<rect x="200" y="87" width="1.0" height="14" rx="3" fill="#f59e0b"/>
-<text x="206.0" y="98" font-size="10" font-family="Menlo,monospace" fill="#334155">2.1 GFLOPS</text>
-<rect x="200" y="104" width="1.0" height="14" rx="3" fill="#ef4444"/>
-<text x="206.0" y="115" font-size="10" font-family="Menlo,monospace" fill="#334155">2.0 GFLOPS</text>
-<rect x="200" y="121" width="5.4" height="14" rx="3" fill="#10b981"/>
-<text x="210.4" y="132" font-size="10" font-family="Menlo,monospace" fill="#334155">12.7 GFLOPS</text>
+<rect x="200" y="70" width="8.0" height="14" rx="3" fill="#6366f1"/>
+<text x="213.0" y="81" font-size="10" font-family="Menlo,monospace" fill="#334155">2.2 GFLOPS</text>
+<rect x="200" y="87" width="8.0" height="14" rx="3" fill="#f59e0b"/>
+<text x="213.0" y="98" font-size="10" font-family="Menlo,monospace" fill="#334155">2.2 GFLOPS</text>
+<rect x="200" y="104" width="8.0" height="14" rx="3" fill="#ef4444"/>
+<text x="213.0" y="115" font-size="10" font-family="Menlo,monospace" fill="#334155">2.2 GFLOPS</text>
+<rect x="200" y="121" width="40.8" height="14" rx="3" fill="#10b981"/>
+<text x="245.8" y="132" font-size="10" font-family="Menlo,monospace" fill="#334155">11.0 GFLOPS</text>
 <text x="12" y="188" font-size="11" font-family="Menlo,monospace" fill="#111827">16x16x16</text>
-<rect x="200" y="150" width="2.2" height="14" rx="3" fill="#6366f1"/>
-<text x="207.2" y="161" font-size="10" font-family="Menlo,monospace" fill="#334155">5.1 GFLOPS</text>
-<rect x="200" y="167" width="6.0" height="14" rx="3" fill="#f59e0b"/>
-<text x="211.0" y="178" font-size="10" font-family="Menlo,monospace" fill="#334155">14.1 GFLOPS</text>
-<rect x="200" y="184" width="6.1" height="14" rx="3" fill="#ef4444"/>
-<text x="211.1" y="195" font-size="10" font-family="Menlo,monospace" fill="#334155">14.2 GFLOPS</text>
-<rect x="200" y="201" width="6.3" height="14" rx="3" fill="#10b981"/>
-<text x="211.3" y="212" font-size="10" font-family="Menlo,monospace" fill="#334155">14.8 GFLOPS</text>
+<rect x="200" y="150" width="10.5" height="14" rx="3" fill="#6366f1"/>
+<text x="215.5" y="161" font-size="10" font-family="Menlo,monospace" fill="#334155">2.8 GFLOPS</text>
+<rect x="200" y="167" width="10.5" height="14" rx="3" fill="#f59e0b"/>
+<text x="215.5" y="178" font-size="10" font-family="Menlo,monospace" fill="#334155">2.8 GFLOPS</text>
+<rect x="200" y="184" width="10.5" height="14" rx="3" fill="#ef4444"/>
+<text x="215.5" y="195" font-size="10" font-family="Menlo,monospace" fill="#334155">2.8 GFLOPS</text>
+<rect x="200" y="201" width="67.1" height="14" rx="3" fill="#10b981"/>
+<text x="272.1" y="212" font-size="10" font-family="Menlo,monospace" fill="#334155">18.1 GFLOPS</text>
 <text x="12" y="268" font-size="11" font-family="Menlo,monospace" fill="#111827">32x32x32</text>
-<rect x="200" y="230" width="4.1" height="14" rx="3" fill="#6366f1"/>
-<text x="209.1" y="241" font-size="10" font-family="Menlo,monospace" fill="#334155">9.7 GFLOPS</text>
-<rect x="200" y="247" width="15.8" height="14" rx="3" fill="#f59e0b"/>
-<text x="220.8" y="258" font-size="10" font-family="Menlo,monospace" fill="#334155">37.0 GFLOPS</text>
-<rect x="200" y="264" width="15.8" height="14" rx="3" fill="#ef4444"/>
-<text x="220.8" y="275" font-size="10" font-family="Menlo,monospace" fill="#334155">36.9 GFLOPS</text>
-<rect x="200" y="281" width="43.1" height="14" rx="3" fill="#10b981"/>
-<text x="248.1" y="292" font-size="10" font-family="Menlo,monospace" fill="#334155">100.8 GFLOPS</text>
+<rect x="200" y="230" width="18.9" height="14" rx="3" fill="#6366f1"/>
+<text x="223.9" y="241" font-size="10" font-family="Menlo,monospace" fill="#334155">5.1 GFLOPS</text>
+<rect x="200" y="247" width="18.9" height="14" rx="3" fill="#f59e0b"/>
+<text x="223.9" y="258" font-size="10" font-family="Menlo,monospace" fill="#334155">5.1 GFLOPS</text>
+<rect x="200" y="264" width="18.9" height="14" rx="3" fill="#ef4444"/>
+<text x="223.9" y="275" font-size="10" font-family="Menlo,monospace" fill="#334155">5.1 GFLOPS</text>
+<rect x="200" y="281" width="214.5" height="14" rx="3" fill="#10b981"/>
+<text x="419.5" y="292" font-size="10" font-family="Menlo,monospace" fill="#334155">57.8 GFLOPS</text>
 <text x="12" y="348" font-size="11" font-family="Menlo,monospace" fill="#111827">64x64x64</text>
-<rect x="200" y="310" width="7.4" height="14" rx="3" fill="#6366f1"/>
-<text x="212.4" y="321" font-size="10" font-family="Menlo,monospace" fill="#334155">17.2 GFLOPS</text>
-<rect x="200" y="327" width="33.6" height="14" rx="3" fill="#f59e0b"/>
-<text x="238.6" y="338" font-size="10" font-family="Menlo,monospace" fill="#334155">78.5 GFLOPS</text>
-<rect x="200" y="344" width="33.7" height="14" rx="3" fill="#ef4444"/>
-<text x="238.7" y="355" font-size="10" font-family="Menlo,monospace" fill="#334155">78.8 GFLOPS</text>
-<rect x="200" y="361" width="205.4" height="14" rx="3" fill="#10b981"/>
-<text x="410.4" y="372" font-size="10" font-family="Menlo,monospace" fill="#334155">480.3 GFLOPS</text>
+<rect x="200" y="310" width="31.7" height="14" rx="3" fill="#6366f1"/>
+<text x="236.7" y="321" font-size="10" font-family="Menlo,monospace" fill="#334155">8.6 GFLOPS</text>
+<rect x="200" y="327" width="31.7" height="14" rx="3" fill="#f59e0b"/>
+<text x="236.7" y="338" font-size="10" font-family="Menlo,monospace" fill="#334155">8.6 GFLOPS</text>
+<rect x="200" y="344" width="31.7" height="14" rx="3" fill="#ef4444"/>
+<text x="236.7" y="355" font-size="10" font-family="Menlo,monospace" fill="#334155">8.6 GFLOPS</text>
+<rect x="200" y="361" width="188.7" height="14" rx="3" fill="#10b981"/>
+<text x="393.7" y="372" font-size="10" font-family="Menlo,monospace" fill="#334155">50.8 GFLOPS</text>
 <text x="12" y="428" font-size="11" font-family="Menlo,monospace" fill="#111827">128x128x128</text>
-<rect x="200" y="390" width="10.2" height="14" rx="3" fill="#6366f1"/>
-<text x="215.2" y="401" font-size="10" font-family="Menlo,monospace" fill="#334155">23.8 GFLOPS</text>
-<rect x="200" y="407" width="59.8" height="14" rx="3" fill="#f59e0b"/>
-<text x="264.8" y="418" font-size="10" font-family="Menlo,monospace" fill="#334155">139.9 GFLOPS</text>
-<rect x="200" y="424" width="59.7" height="14" rx="3" fill="#ef4444"/>
-<text x="264.7" y="435" font-size="10" font-family="Menlo,monospace" fill="#334155">139.7 GFLOPS</text>
-<rect x="200" y="441" width="440.5" height="14" rx="3" fill="#10b981"/>
-<text x="645.5" y="452" font-size="10" font-family="Menlo,monospace" fill="#334155">1030.2 GFLOPS</text>
+<rect x="200" y="390" width="54.1" height="14" rx="3" fill="#6366f1"/>
+<text x="259.1" y="401" font-size="10" font-family="Menlo,monospace" fill="#334155">14.6 GFLOPS</text>
+<rect x="200" y="407" width="54.1" height="14" rx="3" fill="#f59e0b"/>
+<text x="259.1" y="418" font-size="10" font-family="Menlo,monospace" fill="#334155">14.6 GFLOPS</text>
+<rect x="200" y="424" width="54.1" height="14" rx="3" fill="#ef4444"/>
+<text x="259.1" y="435" font-size="10" font-family="Menlo,monospace" fill="#334155">14.6 GFLOPS</text>
+<rect x="200" y="441" width="407.7" height="14" rx="3" fill="#10b981"/>
+<text x="612.7" y="452" font-size="10" font-family="Menlo,monospace" fill="#334155">109.9 GFLOPS</text>
 <text x="12" y="508" font-size="11" font-family="Menlo,monospace" fill="#111827">256x256x256</text>
-<rect x="200" y="470" width="13.0" height="14" rx="3" fill="#6366f1"/>
-<text x="218.0" y="481" font-size="10" font-family="Menlo,monospace" fill="#334155">30.4 GFLOPS</text>
-<rect x="200" y="487" width="105.8" height="14" rx="3" fill="#f59e0b"/>
-<text x="310.8" y="498" font-size="10" font-family="Menlo,monospace" fill="#334155">247.5 GFLOPS</text>
-<rect x="200" y="504" width="107.7" height="14" rx="3" fill="#ef4444"/>
-<text x="312.7" y="515" font-size="10" font-family="Menlo,monospace" fill="#334155">251.9 GFLOPS</text>
-<rect x="200" y="521" width="595.5" height="14" rx="3" fill="#10b981"/>
-<text x="800.5" y="532" font-size="10" font-family="Menlo,monospace" fill="#334155">1392.8 GFLOPS</text>
+<rect x="200" y="470" width="72.9" height="14" rx="3" fill="#6366f1"/>
+<text x="277.9" y="481" font-size="10" font-family="Menlo,monospace" fill="#334155">19.6 GFLOPS</text>
+<rect x="200" y="487" width="72.9" height="14" rx="3" fill="#f59e0b"/>
+<text x="277.9" y="498" font-size="10" font-family="Menlo,monospace" fill="#334155">19.6 GFLOPS</text>
+<rect x="200" y="504" width="72.9" height="14" rx="3" fill="#ef4444"/>
+<text x="277.9" y="515" font-size="10" font-family="Menlo,monospace" fill="#334155">19.6 GFLOPS</text>
+<rect x="200" y="521" width="700.0" height="14" rx="3" fill="#10b981"/>
+<text x="905.0" y="532" font-size="10" font-family="Menlo,monospace" fill="#334155">188.6 GFLOPS</text>
 <text x="12" y="588" font-size="11" font-family="Menlo,monospace" fill="#111827">512x512x512</text>
-<rect x="200" y="550" width="13.9" height="14" rx="3" fill="#6366f1"/>
-<text x="218.9" y="561" font-size="10" font-family="Menlo,monospace" fill="#334155">32.5 GFLOPS</text>
-<rect x="200" y="567" width="147.7" height="14" rx="3" fill="#f59e0b"/>
-<text x="352.7" y="578" font-size="10" font-family="Menlo,monospace" fill="#334155">345.4 GFLOPS</text>
-<rect x="200" y="584" width="419.9" height="14" rx="3" fill="#ef4444"/>
-<text x="624.9" y="595" font-size="10" font-family="Menlo,monospace" fill="#334155">982.0 GFLOPS</text>
-<rect x="200" y="601" width="700.0" height="14" rx="3" fill="#10b981"/>
-<text x="905.0" y="612" font-size="10" font-family="Menlo,monospace" fill="#334155">1637.1 GFLOPS</text>
+<rect x="200" y="550" width="81.6" height="14" rx="3" fill="#6366f1"/>
+<text x="286.6" y="561" font-size="10" font-family="Menlo,monospace" fill="#334155">22.0 GFLOPS</text>
+<rect x="200" y="567" width="81.6" height="14" rx="3" fill="#f59e0b"/>
+<text x="286.6" y="578" font-size="10" font-family="Menlo,monospace" fill="#334155">22.0 GFLOPS</text>
+<rect x="200" y="584" width="81.6" height="14" rx="3" fill="#ef4444"/>
+<text x="286.6" y="595" font-size="10" font-family="Menlo,monospace" fill="#334155">22.0 GFLOPS</text>
+<rect x="200" y="601" width="647.4" height="14" rx="3" fill="#10b981"/>
+<text x="852.4" y="612" font-size="10" font-family="Menlo,monospace" fill="#334155">174.4 GFLOPS</text>
 </svg>
