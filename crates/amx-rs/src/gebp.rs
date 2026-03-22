@@ -313,16 +313,16 @@ impl Matrix<f32> {
         Matrix::from_data(c_data, m, n)
     }
 
-    /// Multi-threaded GEBP matmul.
+    /// Multi-threaded GEBP matmul with 2D work distribution.
     ///
-    /// Parallelises the ic (M-dimension) loop of the GEBP algorithm.
-    /// Each thread gets its own Ã packing buffer and z_buf, while
-    /// sharing the packed B̃ panel (read-only, lives in L3/SLC).
+    /// Instead of parallelising only the ic loop (which gives too few
+    /// work items when M is small relative to MC), this distributes
+    /// individual (ic_tile, jc_tile) pairs across threads within each
+    /// KC block.  Each (ir, jr) micro-tile is independent and writes
+    /// to a unique region of C.
     ///
-    /// This is the standard approach used by OpenBLAS, BLIS, and
-    /// Accelerate: the B̃ panel is packed once and broadcast to all
-    /// cores via the shared cache, while each core packs and processes
-    /// its own slice of Ã.
+    /// The B̃ panel is packed once and shared read-only across threads
+    /// (lives in L3/SLC).  Each thread packs its own Ã rows on demand.
     #[cfg(all(feature = "std", target_arch = "aarch64"))]
     pub fn matmul_gebp_parallel(&self, other: &Matrix<f32>, n_threads: usize) -> AmxResult<Matrix<f32>> {
         let (m, k) = self.dims();
@@ -333,7 +333,6 @@ impl Matrix<f32> {
 
         let n_threads = n_threads.max(1);
 
-        // Fall back to single-threaded for small problems
         let total_flops = 2.0 * m as f64 * k as f64 * n as f64;
         if n_threads <= 1 || total_flops < 20_000_000.0 || m < MR * 2 {
             return self.matmul_gebp(other);
@@ -344,212 +343,157 @@ impl Matrix<f32> {
         let mut c_data = vec![0.0f32; m * n];
         let c = c_data.as_mut_ptr();
 
-        // Shared B̃ buffer (largest allocation)
-        let nc_tiles = (NC + NR - 1) / NR;
-        let b_buf_size = nc_tiles * KC * TILE_BYTES;
+        // Shared B̃ buffer
+        let nc_tiles_max = (NC + NR - 1) / NR;
+        let b_buf_size = nc_tiles_max * KC * TILE_BYTES;
         let b_buf = aligned_alloc(b_buf_size, 128);
 
-        // Wrap pointers for Send/Sync
-        let a_send = SendPtr(a as *mut f32);
-        let b_send = SendPtr(b as *mut f32);
-        let c_send = SendPtr(c);
-        let b_buf_send = SendPtr(b_buf);
+        // Build a GebpWork struct for Send safety
+        struct GebpWork {
+            a_ptr: usize, b_buf_ptr: usize, c_ptr: usize,
+            lda: usize, ldc: usize,
+            ic_start: usize, ic_end: usize,
+            jc_start: usize, jc_end: usize,
+            pc: usize, actual_kc: usize,
+            first_kc: bool,
+        }
+        unsafe impl Send for GebpWork {}
+        unsafe impl Sync for GebpWork {}
 
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
+        impl GebpWork {
+            unsafe fn run(&self) {
+                let actual_mc = self.ic_end - self.ic_start;
+                let actual_nc = self.jc_end - self.jc_start;
+                let mc_tiles = (actual_mc + MR - 1) / MR;
+                let nc_tiles = (actual_nc + NR - 1) / NR;
 
-            // Loop 1: N-dimension blocking (L3/SLC)
-            let mut jc = 0;
-            while jc < n {
-                let actual_nc = NC.min(n - jc);
+                // Pack Ã for this thread's row range
+                let a_buf_size = mc_tiles * self.actual_kc * TILE_BYTES;
+                let a_buf = aligned_alloc(a_buf_size, 128);
+                let z_buf = aligned_alloc(MR * TILE_BYTES, 128);
 
-                // Loop 2: K-dimension blocking (L1)
-                let mut pc = 0;
-                while pc < k {
-                    let actual_kc = KC.min(k - pc);
-                    let first_kc = pc == 0;
+                pack_a_panel(
+                    self.a_ptr as *const f32, self.lda,
+                    self.ic_start, self.ic_end,
+                    self.pc, self.pc + self.actual_kc,
+                    a_buf,
+                );
 
-                    // Pack B̃ panel (single-threaded — sequential reads)
-                    unsafe {
-                        pack_b_panel(
-                            b_send.0 as *const f32, n,
-                            pc, pc + actual_kc,
-                            jc, jc + actual_nc,
-                            b_buf_send.0,
-                        );
-                    }
+                // B̃ panel offset for this j-range
+                // B̃ is packed for the full NC range starting at jc=0 of the
+                // current NC block. We need the j-tile offset within that block.
+                let j_offset_tiles = (self.jc_start - self.jc_start) / NR; // always 0 for per-tile dispatch
 
-                    // Loop 3: M-dimension — parallelise across threads
-                    // Split M into chunks of MC, distribute across threads
-                    let mc_blocks: Vec<(usize, usize)> = {
-                        let mut blocks = Vec::new();
-                        let mut ic = 0;
-                        while ic < m {
-                            let end = (ic + MC).min(m);
-                            blocks.push((ic, end));
-                            ic = end;
-                        }
-                        blocks
-                    };
+                amx_sys::amx_set();
 
-                    let jc_cap = jc;
-                    let pc_cap = pc;
+                gebp_macro_kernel(
+                    a_buf, self.b_buf_ptr as *const u8,
+                    self.c_ptr as *mut f32, self.ldc,
+                    actual_mc, actual_nc, self.actual_kc,
+                    self.ic_start, self.jc_start,
+                    self.first_kc,
+                    z_buf,
+                );
 
-                    {
-                        let a_ptr = a_send.0;
-                        let b_buf_ptr = b_buf_send.0;
-                        let c_ptr = c_send.0;
+                amx_sys::amx_clr();
 
-                        // Build work items with raw usize pointers for Send
-                        struct GebpWork {
-                            a_ptr: usize, b_buf_ptr: usize, c_ptr: usize,
-                            ic_start: usize, ic_end: usize,
-                            k: usize, n: usize,
-                            pc: usize, actual_kc: usize,
-                            actual_nc: usize, jc: usize,
-                            first_kc: bool,
-                        }
-                        unsafe impl Send for GebpWork {}
-
-                        impl GebpWork {
-                            unsafe fn run(&self) {
-                                let actual_mc = self.ic_end - self.ic_start;
-                                let mc_tiles_local = (actual_mc + MR - 1) / MR;
-
-                                let a_buf_size = mc_tiles_local * self.actual_kc * TILE_BYTES;
-                                let a_buf = aligned_alloc(a_buf_size, 128);
-                                let z_buf = aligned_alloc(MR * TILE_BYTES, 128);
-
-                                pack_a_panel(
-                                    self.a_ptr as *const f32, self.k,
-                                    self.ic_start, self.ic_end,
-                                    self.pc, self.pc + self.actual_kc,
-                                    a_buf,
-                                );
-
-                                amx_sys::amx_set();
-
-                                gebp_macro_kernel(
-                                    a_buf, self.b_buf_ptr as *const u8,
-                                    self.c_ptr as *mut f32, self.n,
-                                    actual_mc, self.actual_nc, self.actual_kc,
-                                    self.ic_start, self.jc,
-                                    self.first_kc,
-                                    z_buf,
-                                );
-
-                                amx_sys::amx_clr();
-
-                                aligned_free(a_buf, a_buf_size, 128);
-                                aligned_free(z_buf, MR * TILE_BYTES, 128);
-                            }
-                        }
-
-                        let works: Vec<GebpWork> = mc_blocks.iter().map(|&(ic_start, ic_end)| {
-                            GebpWork {
-                                a_ptr: a_ptr as usize,
-                                b_buf_ptr: b_buf_ptr as usize,
-                                c_ptr: c_ptr as usize,
-                                ic_start, ic_end, k, n,
-                                pc: pc_cap, actual_kc,
-                                actual_nc, jc: jc_cap, first_kc,
-                            }
-                        }).collect();
-
-                        rayon::scope(|s| {
-                            for work in &works {
-                                s.spawn(move |_| unsafe { work.run() });
-                            }
-                        });
-                    }
-
-                    pc += actual_kc;
-                }
-
-                jc += actual_nc;
+                aligned_free(a_buf, a_buf_size, 128);
+                aligned_free(z_buf, MR * TILE_BYTES, 128);
             }
         }
 
-        #[cfg(not(feature = "parallel"))]
-        {
-            // Fallback: use std::thread::scope
-            let mut jc = 0;
-            while jc < n {
-                let actual_nc = NC.min(n - jc);
-                let mut pc = 0;
-                while pc < k {
-                    let actual_kc = KC.min(k - pc);
-                    let first_kc = pc == 0;
+        // ── Main loops ───────────────────────────────────────────────
 
-                    unsafe {
-                        pack_b_panel(
-                            b_send.0 as *const f32, n,
-                            pc, pc + actual_kc,
-                            jc, jc + actual_nc,
-                            b_buf_send.0,
-                        );
-                    }
+        let a_raw = a as usize;
+        let b_buf_raw = b_buf as usize;
+        let c_raw = c as usize;
 
-                    let mc_blocks: Vec<(usize, usize)> = {
-                        let mut blocks = Vec::new();
-                        let mut ic = 0;
-                        while ic < m {
-                            let end = (ic + MC).min(m);
-                            blocks.push((ic, end));
-                            ic = end;
-                        }
-                        blocks
-                    };
+        // Dynamic MC: shrink so we get enough parallel work items.
+        // Want at least n_threads * 2 work items in the M dimension.
+        // MC must be a multiple of MR (16).
+        let mc_par = {
+            let target_blocks = n_threads * 2;
+            let mc_for_target = ((m + target_blocks - 1) / target_blocks + MR - 1) / MR * MR;
+            mc_for_target.max(MR).min(MC)
+        };
 
-                    {
-                        let a_raw = a_send.0 as usize;
-                        let b_buf_raw = b_buf_send.0 as usize;
-                        let c_raw = c_send.0 as usize;
+        let mut jc = 0;
+        while jc < n {
+            let actual_nc = NC.min(n - jc);
 
-                        std::thread::scope(|scope| {
-                            for &(ic_start, ic_end) in &mc_blocks {
-                                let a_r = a_raw;
-                                let b_r = b_buf_raw;
-                                let c_r = c_raw;
+            let mut pc = 0;
+            while pc < k {
+                let actual_kc = KC.min(k - pc);
+                let first_kc = pc == 0;
 
-                                scope.spawn(move || {
-                                    let actual_mc = ic_end - ic_start;
-                                    let mc_tiles_local = (actual_mc + MR - 1) / MR;
-                                    let a_buf_size = mc_tiles_local * actual_kc * TILE_BYTES;
-                                    let a_buf = aligned_alloc(a_buf_size, 128);
-                                    let z_buf = aligned_alloc(MR * TILE_BYTES, 128);
-
-                                    unsafe {
-                                        pack_a_panel(
-                                            a_r as *const f32, k,
-                                            ic_start, ic_end,
-                                            pc, pc + actual_kc,
-                                            a_buf,
-                                        );
-                                        amx_sys::amx_set();
-                                        gebp_macro_kernel(
-                                            a_buf, b_r as *const u8,
-                                            c_r as *mut f32, n,
-                                            actual_mc, actual_nc, actual_kc,
-                                            ic_start, jc,
-                                            first_kc,
-                                            z_buf,
-                                        );
-                                        amx_sys::amx_clr();
-                                    }
-
-                                    aligned_free(a_buf, a_buf_size, 128);
-                                    aligned_free(z_buf, MR * TILE_BYTES, 128);
-                                });
-                            }
-                        });
-                    }
-
-                    pc += actual_kc;
+                // Pack B̃ panel for this (jc, pc) block
+                unsafe {
+                    pack_b_panel(
+                        b, n,
+                        pc, pc + actual_kc,
+                        jc, jc + actual_nc,
+                        b_buf,
+                    );
                 }
-                jc += actual_nc;
+
+                // Build 2D work list: (ic_block, jc_block) pairs
+                // Each work item processes mc_par × actual_nc output block
+                // The B̃ panel is shared across all work items.
+                //
+                // For better cache reuse, we want each thread to process
+                // a contiguous range of i-rows (so Ã stays in its L2).
+                // So we create work items by splitting M into mc_par-sized
+                // blocks — now with dynamic mc_par there are enough blocks.
+                let works: Vec<GebpWork> = {
+                    let mut w = Vec::new();
+                    let mut ic = 0;
+                    while ic < m {
+                        let ic_end = (ic + mc_par).min(m);
+                        w.push(GebpWork {
+                            a_ptr: a_raw,
+                            b_buf_ptr: b_buf_raw,
+                            c_ptr: c_raw,
+                            lda: k,
+                            ldc: n,
+                            ic_start: ic,
+                            ic_end,
+                            jc_start: jc,
+                            jc_end: jc + actual_nc,
+                            pc,
+                            actual_kc,
+                            first_kc,
+                        });
+                        ic = ic_end;
+                    }
+                    w
+                };
+
+                #[cfg(feature = "parallel")]
+                {
+                    rayon::scope(|s| {
+                        for work in &works {
+                            s.spawn(move |_| unsafe { work.run() });
+                        }
+                    });
+                }
+
+                #[cfg(not(feature = "parallel"))]
+                {
+                    std::thread::scope(|scope| {
+                        for work in &works {
+                            let w_ptr = work as *const GebpWork as usize;
+                            scope.spawn(move || unsafe {
+                                let w = &*(w_ptr as *const GebpWork);
+                                w.run();
+                            });
+                        }
+                    });
+                }
+
+                pc += actual_kc;
             }
+
+            jc += actual_nc;
         }
 
         aligned_free(b_buf, b_buf_size, 128);

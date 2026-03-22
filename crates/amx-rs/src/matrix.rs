@@ -312,11 +312,12 @@ impl Matrix<f32> {
                 // GEBP with full cache blocking for large matrices;
                 // direct AMX tiling for medium matrices where GEBP packing
                 // overhead would dominate.
-                // GEBP wins at large sizes where cache blocking matters.
-                // Below ~500×500×500, the packing overhead dominates.
+                // GEBP with full L1/L2/L3 cache blocking for large matrices
+                // where the working set exceeds L2 cache (4 MB on Apple Silicon).
+                // For medium matrices, direct AMX tiling with simpler packing wins.
                 let total_ops = m * k * n;
                 let min_dim = m.min(k).min(n);
-                let use_gebp = total_ops > 200_000_000 && min_dim >= 64; // ~585×585×585
+                let use_gebp = total_ops > 200_000_000 && min_dim >= 64;
 
                 #[cfg(feature = "std")]
                 {
