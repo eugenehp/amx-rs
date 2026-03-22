@@ -36,6 +36,30 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Check AMX and Accelerate availability
+        run: |
+          cat > /tmp/check_amx.c << 'EOF'
+          #include <stdio.h>
+          #include <Accelerate/Accelerate.h>
+          #include <time.h>
+          int main() {
+            float a[64*64], b[64*64], c[64*64];
+            for (int i = 0; i < 64*64; i++) { a[i] = 0.01f*(i%17); b[i] = 0.01f*(i%13); }
+            struct timespec t0, t1;
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, 64,64,64, 1.0f, a,64, b,64, 0.0f, c,64);
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            for (int i = 0; i < 10000; i++)
+              cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, 64,64,64, 1.0f, a,64, b,64, 0.0f, c,64);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double ns = ((t1.tv_sec-t0.tv_sec)*1e9 + (t1.tv_nsec-t0.tv_nsec)) / 10000;
+            double gf = 2.0*64*64*64 / ns;
+            printf("Accelerate cblas_sgemm 64x64: %.0f ns, %.0f GF/s\n", ns, gf);
+            printf("c[0] = %f (sanity check)\n", c[0]);
+            return 0;
+          }
+          EOF
+          cc -O2 -framework Accelerate -Wno-deprecated /tmp/check_amx.c -o /tmp/check_amx && /tmp/check_amx
+
       - name: Run benchmark
         run: |
           STAMP=$(date +%Y%m%d-%H%M%S)

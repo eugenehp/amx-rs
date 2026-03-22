@@ -24,6 +24,28 @@ pub struct Matrix<T> {
 
 // Safety: col_ptr is lazily initialized and then immutable.
 // Only written once under the check `col_ptr.is_null()`.
+/// Call Accelerate's cblas_sgemm with CblasTrans on pre-transposed A.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+unsafe fn accelerate_sgemm_trans(
+    a_col: *const f32, lda: i32,
+    b: *const f32, ldb: i32,
+    c: *mut f32, ldc: i32,
+    m: i32, n: i32, k: i32,
+) {
+    #[link(name = "Accelerate", kind = "framework")]
+    extern "C" {
+        fn cblas_sgemm(
+            order: i32, transa: i32, transb: i32,
+            m: i32, n: i32, k: i32,
+            alpha: f32, a: *const f32, lda: i32,
+            b: *const f32, ldb: i32,
+            beta: f32, c: *mut f32, ldc: i32,
+        );
+    }
+    cblas_sgemm(101, 112, 111, m, n, k, 1.0, a_col, lda, b, ldb, 0.0, c, ldc);
+}
+
 unsafe impl<T: Send> Send for Matrix<T> {}
 unsafe impl<T: Sync> Sync for Matrix<T> {}
 
@@ -437,28 +459,12 @@ impl Matrix<f32> {
                             let (a_col, a_stride) = self.ensure_col_cache();
                             let mut c_data = Vec::with_capacity(m * n);
                             unsafe { c_data.set_len(m * n); }
-
-                            #[link(name = "Accelerate", kind = "framework")]
-                            extern "C" {
-                                fn cblas_sgemm(
-                                    order: i32, transa: i32, transb: i32,
-                                    m: i32, n: i32, k: i32,
-                                    alpha: f32, a: *const f32, lda: i32,
-                                    b: *const f32, ldb: i32,
-                                    beta: f32, c: *mut f32, ldc: i32,
-                                );
-                            }
                             unsafe {
-                                cblas_sgemm(
-                                    101, // CblasRowMajor
-                                    112, // CblasTrans
-                                    111, // CblasNoTrans
-                                    m as i32, n as i32, k as i32,
-                                    1.0,
-                                    a_col, a_stride as i32,  // transposed A
+                                accelerate_sgemm_trans(
+                                    a_col, a_stride as i32,
                                     other.as_slice().as_ptr(), n as i32,
-                                    0.0,
                                     c_data.as_mut_ptr(), n as i32,
+                                    m as i32, n as i32, k as i32,
                                 );
                             }
                             return Matrix::from_data(c_data, m, n);
