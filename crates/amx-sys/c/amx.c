@@ -866,54 +866,85 @@ void amx_sgemm_worker(
         int i_blk = it * TILE;
         int tile_m = TILE < (m - i_blk) ? TILE : (m - i_blk);
         
-        // Zero-copy with per-worker transpose: 
-        // Worker transposes its own 16 rows of A into a_pack_buf (column-major),
-        // then uses direct ldy (contiguous columns) + direct ldx (B rows).
-        // This replaces column-gather packing with a tiny local transpose.
+        // Apple-style zero-copy: load A rows into Z, extry→Y, ldx B, fma32
+        // This is what sgePack_A_Tran does with its 240 AMX instructions.
+        // Step 1: Load 16 rows of A into Z via ldz (A rows are contiguous!)
+        // Step 2: For each j-tile: zero Z for results, but we need A in Z...
+        // PROBLEM: Z is used for BOTH storing A data AND accumulating results.
+        // Apple solves this by using extry to copy A rows from Z→Y BEFORE
+        // zeroing Z for results. But then Z has results, not A data.
+        //
+        // Apple's actual flow:
+        // a) Load A tile into Z (16 ldz)
+        // b) For k-step: extry Z[k]→Y, ldx B[k]→X, fma Z+=Y⊗X
+        //    But fma OVERWRITES Z with results, destroying A data in Z!
+        //
+        // Solution: A is loaded into Z rows that DON'T overlap with fma output.
+        // fma32 outer product writes to Z rows 0,4,8,...,60 (every 4th row).
+        // A data can be stored in OTHER Z rows (1,2,3,5,6,7,...).
+        // Then extry extracts from non-fma rows.
+        //
+        // For tile_m=16: fma uses rows 0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60
+        // Remaining: rows 1,2,3,5,6,7,9,10,11,...  = 48 available rows
+        // Each A row = 64 bytes = 1 Z row. With k up to 48, we can fit 48 k-steps!
+        //
+        // For larger k, process in KC blocks of 48.
         if (direct_b == 3) {
-            // Transpose this i-tile's rows: a_pack_buf[ii + kk*16] = A[i_blk+ii, kk]
-            // A is row-major: A[i,k] = a[i*lda + k]
-            float* at = (float*)a_pack_buf;
-            for (int kk = 0; kk < k; kk++)
-                for (int ii = 0; ii < tile_m; ii++)
-                    at[ii + kk * TILE] = a[(i_blk + ii) * lda + kk];
-            // Now at[ii + kk*16] is column-major: column kk = at[kk*16..kk*16+15] (contiguous!)
-            
             int n_j_tiles_local = (n + TILE - 1) / TILE;
+            const int KC = 48; // max k-steps that fit in non-fma Z rows
+            
             for (int jt = 0; jt < n_j_tiles_local; jt++) {
                 int j_blk = jt * TILE;
                 int tile_n_local = TILE < (n - j_blk) ? TILE : (n - j_blk);
+                uint8_t* z_dst = z_buf + jt * tile_m * TILE_BYTES;
                 
+                // Zero fma Z rows (results accumulator)
                 static const uint8_t zz[64] __attribute__((aligned(128))) = {0};
                 for (int r = 0; r < 16; r++)
                     AMX_OP_GPR(4, (uint64_t)zz | ((uint64_t)(r*4) << 56));
                 
-                #define FMA32_Y_ZC2(row) ((uint64_t)(row) << 6)
-                int kk = 0;
-                for (; kk + 3 < k; kk += 4) {
-                    // ldy from transposed A: column kk = at[kk*16] (16 contiguous floats)
-                    AMX_OP_GPR(1, (uint64_t)(at + (kk+0)*TILE) | (0ULL << 56));
-                    AMX_OP_GPR(1, (uint64_t)(at + (kk+1)*TILE) | (1ULL << 56));
-                    AMX_OP_GPR(1, (uint64_t)(at + (kk+2)*TILE) | (2ULL << 56));
-                    AMX_OP_GPR(1, (uint64_t)(at + (kk+3)*TILE) | (3ULL << 56));
-                    // ldx from B directly
-                    AMX_OP_GPR(0, (uint64_t)(b + (kk+0)*ldb + j_blk));
-                    AMX_OP_GPR(12, FMA32_Y_ZC2(0));
-                    AMX_OP_GPR(0, (uint64_t)(b + (kk+1)*ldb + j_blk));
-                    AMX_OP_GPR(12, FMA32_Y_ZC2(1));
-                    AMX_OP_GPR(0, (uint64_t)(b + (kk+2)*ldb + j_blk));
-                    AMX_OP_GPR(12, FMA32_Y_ZC2(2));
-                    AMX_OP_GPR(0, (uint64_t)(b + (kk+3)*ldb + j_blk));
-                    AMX_OP_GPR(12, FMA32_Y_ZC2(3));
+                // Process k in chunks of KC
+                for (int kc = 0; kc < k; kc += KC) {
+                    int actual_kc = KC < (k - kc) ? KC : (k - kc);
+                    
+                    // Load actual_kc rows of A into non-fma Z rows
+                    // Non-fma rows: 1,2,3, 5,6,7, 9,10,11, ... (3 per group of 4)
+                    // Map kk → Z row: skip every 4th (0,4,8,12,...)
+                    for (int kk = 0; kk < actual_kc; kk++) {
+                        int z_row = kk + kk/3 + 1; // skip fma rows: 1,2,3,5,6,7,9,...
+                        // A row (i_blk+0..tile_m-1, kc+kk) is at a+(i_blk)*lda+(kc+kk)
+                        // But we need the COLUMN, not row. A is row-major.
+                        // A column kc+kk = { A[i_blk+ii, kc+kk] for ii=0..tile_m-1 }
+                        // This is STRIDED — we'd need to gather. 
+                        // Can't avoid it: ldz loads 64 contiguous bytes.
+                        // A[i_blk+0, kc+kk], A[i_blk+1, kc+kk], ... are stride=lda apart.
+                        // We MUST gather into a buffer first, then ldz.
+                        
+                        // Gather A column into a_pack_buf
+                        float* col = (float*)a_pack_buf;
+                        for (int ii = 0; ii < tile_m; ii++)
+                            col[ii] = a[(i_blk+ii)*lda + kc+kk];
+                        for (int ii = tile_m; ii < 16; ii++)
+                            col[ii] = 0;
+                        AMX_OP_GPR(4, (uint64_t)col | ((uint64_t)z_row << 56));
+                    }
+                    
+                    // Now: non-fma Z rows have A column data.
+                    // Compute: for each kk, extry Z[kk_row]→Y, ldx B, fma32
+                    #define FMA32_Y_ZC3(row) ((uint64_t)(row) << 6)
+                    for (int kk = 0; kk < actual_kc; kk++) {
+                        int z_row = kk + kk/3 + 1;
+                        // extry: Z[z_row] → Y[0]
+                        AMX_OP_GPR(9, (uint64_t)z_row << 20); // extry
+                        // ldx: B[kc+kk, j_blk] → X[0]
+                        AMX_OP_GPR(0, (uint64_t)(b + (kc+kk)*ldb + j_blk));
+                        // fma32: Z += Y[0] ⊗ X[0]
+                        AMX_OP_GPR(12, 0);
+                    }
+                    #undef FMA32_Y_ZC3
                 }
-                for (; kk < k; kk++) {
-                    AMX_OP_GPR(1, (uint64_t)(at + kk*TILE));
-                    AMX_OP_GPR(0, (uint64_t)(b + kk*ldb + j_blk));
-                    AMX_OP_GPR(12, 0);
-                }
-                #undef FMA32_Y_ZC2
                 
-                uint8_t* z_dst = z_buf + jt * tile_m * TILE_BYTES;
+                // Store fma Z rows → z_dst
                 for (int r = 0; r < tile_m; r++)
                     AMX_OP_GPR(5, ((uint64_t)(z_dst + r*64)) | ((uint64_t)(r*4) << 56));
             }
