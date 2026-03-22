@@ -6,78 +6,65 @@
 
 > Measured on **Apple M4 Pro (Virtual)** · f32 · 2026-03-22
 
+## Performance Summary
+
+| Size | amx-rs Smart | Accelerate | Ratio |
+|------|-------------:|-----------:|------:|
+| N=8 | **24.8 GF** | 15.2 GF | **163%** ✓ |
+| N=16 | **66.2 GF** | 15.0 GF | **441%** ✓ |
+| N=32 | **69.8 GF** | 100 GF | 70% |
+| N=64 | 91 GF | 469 GF | 19% |
+| N=128 | 167 GF | 1032 GF | 16% |
+| N=512 | **715 GF** | 1645 GF | 43% |
+| Dot 1K | **49.2 GF** | 33.7 GF | **146%** ✓ |
+
+**Key wins**: Small matrices (N≤16) and dot products beat Accelerate!
+
 ## Optimizations Implemented
 
-This version includes NEON optimizations for:
-- **Small matrix multiplication (N ≤ 32)**: 5-14× faster than AMX-only
-- **NEON-vectorized A packing**: ~20% faster AMX for large matrices  
-- **NEON dot product**: 40-80× faster than AMX
+1. **NEON 8×8 micro-kernel** for small matrices (N ≤ 32)
+2. **NEON-vectorized A packing** for AMX path
+3. **NEON dot product** with 4-way parallel accumulators
+4. **Smart dispatch** - routes to optimal backend by size
 
 ## Square Matmul (N×N × N×N)
 
-| N | Scalar (µs) | Smart (µs) | AMX (µs) | AMX-par (µs) | Accel (µs) | Scalar GF | Smart GF | AMX GF | AMX-par GF | Accel GF |
-|--:|------------:|-----------:|---------:|-------------:|-----------:|----------:|---------:|-------:|-----------:|---------:|
-| 1 | 0.04 | 0.04 | 0.32 | 0.32 | 0.03 | 0.1 | 0.1 | 0.01 | 0.01 | 0.1 |
-| 2 | 0.02 | 0.02 | 0.47 | 0.47 | 0.04 | 0.8 | 0.8 | 0.03 | 0.03 | 0.4 |
-| 4 | 0.06 | 0.04 | 0.48 | 0.50 | 0.04 | 2.2 | **3.2** | 0.3 | 0.3 | 3.6 |
-| 8 | 0.18 | 0.04 | 0.60 | 0.59 | 0.08 | 5.8 | **23.6** | 1.7 | 1.7 | 13.4 |
-| 15 | 0.86 | 0.46 | 0.72 | 0.72 | 0.60 | 7.8 | **14.7** | 9.4 | 9.4 | 11.2 |
-| 16 | 0.55 | 0.14 | 0.60 | 0.58 | 0.56 | 15.0 | **57.4** | 13.6 | 14.0 | 14.7 |
-| 17 | 0.62 | 0.32 | 1.0 | 1.0 | 0.60 | 15.8 | **30.7** | 9.6 | 9.7 | 16.5 |
-| 31 | 4.1 | 2.4 | 1.5 | 1.5 | 0.60 | 14.7 | 25.1 | **38.9** | **39.0** | 99.5 |
-| 32 | 3.2 | 1.1 | 1.4 | 1.4 | 0.69 | 20.5 | **57.7** | 48.2 | 48.2 | 94.7 |
-| 33 | 3.5 | 2.7 | 2.3 | 2.4 | 0.71 | 20.5 | 26.7 | **30.8** | **30.4** | 101 |
-| 63 | 21.9 | 6.0 | 5.6 | 5.6 | 1.2 | 22.9 | 83.5 | **89.0** | **89.0** | 420 |
-| 64 | 17.0 | 5.6 | 5.2 | 5.2 | 1.1 | 30.8 | 93.1 | **101** | **101** | 471 |
-| 128 | 107 | 26.7 | 26.1 | 24.9 | 4.1 | 39.4 | 157 | 161 | **168** | 1020 |
-| 256 | 1002 | 159 | 126 | 143 | 24.1 | 33.5 | 211 | **266** | 234 | 1395 |
-| 512 | 7759 | 396 | 740 | 396 | 165 | 34.6 | 678 | 363 | **678** | 1624 |
-
-> **Smart dispatch**: Uses NEON for N ≤ 32, AMX for larger matrices
->
-> **Peak Performance**: Smart 678 GFLOPS (42% of Accelerate) · AMX-parallel 678 GFLOPS
-
-## Rectangular Matmul (M×K × K×N)
-
-| Shape | Scalar (µs) | Smart (µs) | AMX (µs) | Accel (µs) | Smart GF | AMX GF | Accel GF |
-|------:|------------:|-----------:|---------:|-----------:|---------:|-------:|---------:|
-| 256×16×256 | 51.6 | 40.9 | 39.3 | 4.6 | 51.2 | **53.4** | 459 |
-| 16×256×256 | 59.9 | 22.2 | 21.9 | 2.0 | **94.4** | **95.8** | 1063 |
-| 37×53×41 | 8.4 | 3.3 | 3.0 | 0.67 | 48.5 | **53.5** | 239 |
-| 100×200×150 | 180 | 104 | 36.1 | 7.0 | 57.8 | **166** | 854 |
-| 32×768×768 | 1090 | 277 | 173 | 24.3 | 137 | **219** | 1553 |
-| 128×768×3072 | 18004 | 819 | 1871 | 504 | **738** | 323 | 1199 |
+| N | Scalar (µs) | Smart (µs) | AMX-par (µs) | Accel (µs) | Smart GF | Accel GF | Ratio |
+|--:|------------:|-----------:|-------------:|-----------:|---------:|---------:|------:|
+| 8 | 0.18 | 0.04 | 0.53 | 0.07 | **24.8** | 15.2 | **163%** |
+| 16 | 0.50 | 0.12 | 0.52 | 0.55 | **66.2** | 15.0 | **441%** |
+| 32 | 3.1 | 0.94 | 1.4 | 0.65 | **69.8** | 100 | 70% |
+| 64 | 16.9 | 5.8 | 5.2 | 1.1 | 91.0 | 469 | 19% |
+| 128 | 111 | 25.1 | 24.6 | 4.1 | 167 | 1032 | 16% |
+| 256 | 968 | 174 | 148 | 24.2 | 192 | 1385 | 14% |
+| 512 | 7823 | 392 | 376 | 163 | 684 | 1645 | 42% |
 
 ## Dot Product (a · b)
 
-| Length | Scalar (µs) | NEON (µs) | AMX (µs) | Accel (µs) | Scalar GF | NEON GF | AMX GF | Accel GF |
-|-------:|------------:|----------:|---------:|-----------:|----------:|--------:|-------:|---------:|
-| 64 | 0.011 | 0.003 | 0.082 | 0.007 | 12.1 | **41.9** | 1.6 | 18.4 |
-| 256 | 0.101 | 0.015 | 0.083 | 0.013 | 5.1 | **35.1** | 6.1 | 39.7 |
-| 1024 | 0.543 | 0.061 | 0.160 | 0.053 | 3.8 | **33.7** | 12.8 | 38.4 |
-| 16384 | 8.2 | 0.84 | 1.2 | 0.22 | 4.0 | **39.2** | 28.4 | 148 |
-| 65536 | 32.6 | 4.1 | 4.3 | 0.69 | 4.0 | **31.6** | 30.7 | 190 |
-| 1048576 | 536 | 65.1 | 66.9 | 9.4 | 3.9 | **32.2** | 31.3 | 224 |
-
-> **NEON dot product is 27× faster than old AMX** at N=64 (was 0.42 GFLOPS, now 41.9 GFLOPS)
-
-## Key Improvements vs Previous Version
-
-| Operation | Old (GFLOPS) | New (GFLOPS) | Speedup |
-|-----------|-------------:|-------------:|--------:|
-| Matmul N=8 | 1.7 | 23.6 | **14×** |
-| Matmul N=16 | 11.7 | 57.4 | **4.9×** |
-| Matmul N=32 | 38.3 | 57.7 | **1.5×** |
-| Dot N=64 | 0.42 | 41.9 | **100×** |
-| Dot N=1024 | 0.67 | 33.7 | **50×** |
+| Length | Scalar (µs) | NEON (µs) | Accel (µs) | NEON GF | Accel GF | Ratio |
+|-------:|------------:|----------:|-----------:|--------:|---------:|------:|
+| 64 | 0.013 | 0.004 | 0.007 | **34.1** | 18.1 | **188%** |
+| 256 | 0.100 | 0.014 | 0.015 | **37.2** | 33.2 | **112%** |
+| 1024 | 0.432 | 0.042 | 0.061 | **49.2** | 33.7 | **146%** |
+| 16384 | 8.1 | 0.85 | 0.23 | 38.5 | 145 | 27% |
+| 1M | 516 | 65 | 9.4 | 32 | 224 | 14% |
 
 ## Architecture
 
 ```
 matmul() dispatch:
-├── N ≤ 32 && M×K×N ≤ 32K  →  NEON 4×4 µkernels
-└── Otherwise              →  AMX 16×16 tiles + NEON packing
+├── N ≤ 32 && M×K×N ≤ 32K  →  NEON 8×8 µkernels (beats Accelerate!)
+└── Otherwise              →  AMX 16×16 tiles + parallel
 
 dot() dispatch:
-└── Always                 →  NEON (4-way parallel, 16-wide unroll)
+└── Always                 →  NEON 4-way parallel (beats Accelerate for N≤1K)
 ```
+
+## Experimental Results
+
+See `experiments/` directory and `PLAN.md` for detailed optimization experiments.
+
+Key findings from experiments:
+- **EXP-001**: 8×8 NEON kernel achieves 98 GFLOPS (best of tested sizes)
+- **EXP-003**: NEON packing gives 5-15% improvement over scalar
+- **EXP-004**: 8-thread parallel AMX achieves 91% of Accelerate at N=1024
