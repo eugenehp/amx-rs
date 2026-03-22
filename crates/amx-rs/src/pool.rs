@@ -100,15 +100,15 @@ mod inner {
 
         let mut my_gen = 0u32;
         loop {
-            // Spin until new generation
+            // Tight spin on generation counter (Relaxed for speed)
             loop {
-                let g = pool.generation.load(Ordering::Acquire);
+                let g = pool.generation.load(Ordering::Relaxed);
                 if g > my_gen { my_gen = g; break; }
                 core::hint::spin_loop();
             }
 
-            // Fence: ensure we see the job data written before generation bump
-            std::sync::atomic::fence(Ordering::SeqCst);
+            // Now acquire-fence to see the job data
+            std::sync::atomic::fence(Ordering::Acquire);
 
             // Execute job if tile range is non-empty
             let job = unsafe { &*slot.job.get() };
@@ -220,9 +220,8 @@ mod inner {
             };
         }
 
-        // Full fence + bump generation to wake workers
-        std::sync::atomic::fence(Ordering::SeqCst);
-        let gen = pool.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        // Release fence ensures job writes visible before generation bump
+        let gen = pool.generation.fetch_add(1, Ordering::Release) + 1;
 
         // Wait for all workers to finish this generation
         for i in 0..nw {

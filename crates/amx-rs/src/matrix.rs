@@ -312,13 +312,25 @@ impl Matrix<f32> {
                 // GEBP with full cache blocking for large matrices;
                 // direct AMX tiling for medium matrices where GEBP packing
                 // overhead would dominate.
+                let total_ops = m * k * n;
+                let n_i_tiles = (m + TILE - 1) / TILE;
+                let n_j_tiles = (n + TILE - 1) / TILE;
+                let total_tiles = n_i_tiles * n_j_tiles;
+
                 #[cfg(feature = "std")]
                 {
-                    // Persistent AMX pool: near-zero dispatch overhead,
-                    // pre-packs A and B, distributes tile pairs across
-                    // persistent worker threads.
-                    // Falls back to single-threaded for < 4 tiles.
-                    return self.matmul_pool(other);
+                    if total_ops > 200_000_000 && m.min(k).min(n) >= 64 {
+                        // Large: GEBP with cache blocking
+                        let nt = std::thread::available_parallelism()
+                            .map(|n| n.get()).unwrap_or(1);
+                        return self.matmul_gebp_parallel(other, nt);
+                    } else if total_tiles >= 16 {
+                        // Medium: pool (tiles distributed across workers)
+                        return self.matmul_pool(other);
+                    } else {
+                        // Small: single-thread AMX
+                        return self.matmul_amx(other);
+                    }
                 }
                 #[cfg(not(feature = "std"))]
                 {
