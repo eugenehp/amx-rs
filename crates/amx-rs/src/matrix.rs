@@ -320,9 +320,6 @@ impl Matrix<f32> {
                 #[cfg(feature = "std")]
                 {
                     if n_i_tiles >= 2 {
-                        // Pool with per-worker strategy:
-                        // N≤256, aligned: direct_b=3 (per-worker transpose, zero-pack)
-                        // N>256: direct_b=0 (pre-pack A+B, cache-friendly)
                         return self.matmul_pool(other);
                     } else {
                         return self.matmul_amx(other);

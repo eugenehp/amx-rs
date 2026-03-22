@@ -581,6 +581,59 @@ void amx_f32_tile_loop(
     }
 }
 
+// ── Specialized 64×64 sgemm (zero overhead) ─────────────────────────
+// Single C function, no dispatch, no allocation. AMX must be pre-set.
+// Inline NEON transpose + direct B load + 4Y kernel + direct stz to C.
+void sgemm_64x64(
+    const float* __restrict a,  // 64×64 row-major, 64-byte aligned
+    const float* __restrict b,  // 64×64 row-major, 64-byte aligned
+    float* __restrict c,        // 64×64 output
+    int lda, int ldb, int ldc)  // strides (all 64 for square)
+{
+    static const uint8_t zeros[64] __attribute__((aligned(128))) = {0};
+    float __attribute__((aligned(128))) at[64*16];
+    
+    for (int it = 0; it < (64+15)/16; it++) {
+        int i_blk = it * 16;
+        int tile_m = 16 < (64 - i_blk) ? 16 : (64 - i_blk);
+        
+        // NEON transpose this i-tile
+        for (int kk = 0; kk + 3 < 64; kk += 4)
+            for (int ii = 0; ii < tile_m; ii++) {
+                float32x4_t v = vld1q_f32(a + (i_blk+ii)*lda + kk);
+                at[(kk+0)*16+ii] = vgetq_lane_f32(v, 0);
+                at[(kk+1)*16+ii] = vgetq_lane_f32(v, 1);
+                at[(kk+2)*16+ii] = vgetq_lane_f32(v, 2);
+                at[(kk+3)*16+ii] = vgetq_lane_f32(v, 3);
+            }
+        
+        for (int jt = 0; jt < (64+15)/16; jt++) {
+            int j_blk = jt * 16;
+            uint64_t zbase = (uint64_t)zeros;
+            for (int r = 0; r < 16; r++)
+                AMX_OP_GPR(4, zbase | ((uint64_t)(r*4) << 56));
+            
+            for (int kk = 0; kk + 3 < 64; kk += 4) {
+                AMX_OP_GPR(1, (uint64_t)(at+(kk+0)*16) | (0ULL<<56));
+                AMX_OP_GPR(1, (uint64_t)(at+(kk+1)*16) | (1ULL<<56));
+                AMX_OP_GPR(1, (uint64_t)(at+(kk+2)*16) | (2ULL<<56));
+                AMX_OP_GPR(1, (uint64_t)(at+(kk+3)*16) | (3ULL<<56));
+                AMX_OP_GPR(0, (uint64_t)(b+(kk+0)*ldb+j_blk));
+                AMX_OP_GPR(12, 0x00);
+                AMX_OP_GPR(0, (uint64_t)(b+(kk+1)*ldb+j_blk));
+                AMX_OP_GPR(12, 0x40);
+                AMX_OP_GPR(0, (uint64_t)(b+(kk+2)*ldb+j_blk));
+                AMX_OP_GPR(12, 0x80);
+                AMX_OP_GPR(0, (uint64_t)(b+(kk+3)*ldb+j_blk));
+                AMX_OP_GPR(12, 0xC0);
+            }
+            
+            for (int r = 0; r < tile_m; r++)
+                AMX_OP_GPR(5, ((uint64_t)(c+(i_blk+r)*ldc+j_blk)) | ((uint64_t)(r*4)<<56));
+        }
+    }
+}
+
 // Forward declarations
 void neon_pack_a_tiles(const float* a, int m, int k, int start_it, int end_it, uint8_t* dst);
 
