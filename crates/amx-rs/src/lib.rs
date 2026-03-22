@@ -33,6 +33,7 @@ pub mod vector;
 pub mod algorithms;
 pub mod macros;
 pub mod gebp;
+pub mod pool;
 
 pub use error::{AmxError, AmxResult};
 pub use matrix::Matrix;

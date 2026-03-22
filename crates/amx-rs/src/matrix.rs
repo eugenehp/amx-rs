@@ -161,7 +161,7 @@ pub(crate) fn aligned_free(ptr: *mut u8, size: usize, align: usize) {
 /// `a` must have at least `m * k` elements.
 /// `dst` must point to at least `(end_it - start_it) * k * TILE_BYTES` bytes.
 #[cfg(target_arch = "aarch64")]
-unsafe fn pack_a_tiles(
+pub(crate) unsafe fn pack_a_tiles(
     a: *const f32, m: usize, k: usize,
     start_it: usize, end_it: usize,
     dst: *mut u8,
@@ -183,7 +183,7 @@ unsafe fn pack_a_tiles(
 /// `b` must have at least `k * n` elements.
 /// `dst` must point to at least `n_j_tiles * k * TILE_BYTES` bytes.
 #[cfg(target_arch = "aarch64")]
-unsafe fn pack_b_tiles(
+pub(crate) unsafe fn pack_b_tiles(
     b: *const f32, k: usize, n: usize,
     n_j_tiles: usize,
     dst: *mut u8,
@@ -318,13 +318,14 @@ impl Matrix<f32> {
 
                 #[cfg(feature = "std")]
                 {
-                    let n_threads = std::thread::available_parallelism()
-                        .map(|n| n.get())
-                        .unwrap_or(1);
                     if use_gebp {
+                        let n_threads = std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(1);
                         return self.matmul_gebp_parallel(other, n_threads);
                     } else {
-                        return self.matmul_amx_parallel(other, n_threads);
+                        // Use persistent AMX pool for near-zero dispatch overhead
+                        return self.matmul_pool(other);
                     }
                 }
                 #[cfg(not(feature = "std"))]
@@ -476,6 +477,47 @@ impl Matrix<f32> {
         aligned_free(a_packed, a_pack_size, 64);
         aligned_free(b_packed, b_pack_size, 64);
         aligned_free(z_buf, TILE * TILE_BYTES, 64);
+
+        Matrix::from_data(c_data, m, n)
+    }
+
+    /// AMX matmul using a persistent thread pool.
+    ///
+    /// Workers keep `amx_set()` active and spin-wait on atomics for work.
+    /// This eliminates the ~20-100µs thread spawn + AMX init cost that
+    /// kills parallelism for small-to-medium matrices (64-256).
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    pub fn matmul_pool(&self, other: &Matrix<f32>) -> AmxResult<Matrix<f32>> {
+        let (m, k) = self.dims();
+        let (k2, n) = other.dims();
+        if k != k2 {
+            return Err(AmxError::DimensionMismatch { expected: k, got: k2 });
+        }
+
+        let n_i_tiles = (m + TILE - 1) / TILE;
+        let n_j_tiles = (n + TILE - 1) / TILE;
+
+        // Pack A and B
+        let a_pack_size = n_i_tiles * k * TILE_BYTES;
+        let a_packed = aligned_alloc(a_pack_size, 64);
+        unsafe { pack_a_tiles(self.as_slice().as_ptr(), m, k, 0, n_i_tiles, a_packed); }
+
+        let b_pack_size = n_j_tiles * k * TILE_BYTES;
+        let b_packed = aligned_alloc(b_pack_size, 64);
+        unsafe { pack_b_tiles(other.as_slice().as_ptr(), k, n, n_j_tiles, b_packed); }
+
+        let mut c_data = vec![0.0f32; m * n];
+
+        unsafe {
+            crate::pool::pool_dispatch_tiles(
+                a_packed, b_packed,
+                c_data.as_mut_ptr(),
+                m, k, n,
+            );
+        }
+
+        aligned_free(a_packed, a_pack_size, 64);
+        aligned_free(b_packed, b_pack_size, 64);
 
         Matrix::from_data(c_data, m, n)
     }
