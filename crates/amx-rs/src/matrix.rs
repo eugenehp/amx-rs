@@ -481,9 +481,9 @@ impl Matrix<f32> {
 
     /// AMX matmul using a persistent thread pool.
     ///
-    /// Workers keep `amx_set()` active and spin-wait on atomics for work.
-    /// This eliminates the ~20-100µs thread spawn + AMX init cost that
-    /// kills parallelism for small-to-medium matrices (64-256).
+    /// Workers do their own packing + compute in a single C call.
+    /// No heap allocations on the hot path — packing buffers are
+    /// pre-allocated per worker at pool init time.
     #[cfg(all(feature = "std", target_arch = "aarch64"))]
     pub fn matmul_pool(&self, other: &Matrix<f32>) -> AmxResult<Matrix<f32>> {
         let (m, k) = self.dims();
@@ -492,30 +492,16 @@ impl Matrix<f32> {
             return Err(AmxError::DimensionMismatch { expected: k, got: k2 });
         }
 
-        let n_i_tiles = (m + TILE - 1) / TILE;
-        let n_j_tiles = (n + TILE - 1) / TILE;
-
-        // Pack A and B
-        let a_pack_size = n_i_tiles * k * TILE_BYTES;
-        let a_packed = aligned_alloc(a_pack_size, 64);
-        unsafe { pack_a_tiles(self.as_slice().as_ptr(), m, k, 0, n_i_tiles, a_packed); }
-
-        let b_pack_size = n_j_tiles * k * TILE_BYTES;
-        let b_packed = aligned_alloc(b_pack_size, 64);
-        unsafe { pack_b_tiles(other.as_slice().as_ptr(), k, n, n_j_tiles, b_packed); }
-
         let mut c_data = vec![0.0f32; m * n];
 
         unsafe {
-            crate::pool::pool_dispatch_tiles(
-                a_packed, b_packed,
-                c_data.as_mut_ptr(),
+            crate::pool::pool_sgemm(
+                self.as_slice().as_ptr(), k,
+                other.as_slice().as_ptr(), n,
+                c_data.as_mut_ptr(), n,
                 m, k, n,
             );
         }
-
-        aligned_free(a_packed, a_pack_size, 64);
-        aligned_free(b_packed, b_pack_size, 64);
 
         Matrix::from_data(c_data, m, n)
     }

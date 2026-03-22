@@ -581,6 +581,76 @@ void amx_f32_tile_loop(
     }
 }
 
+// ── Complete sgemm in one C call (pack + compute) ────────────────────
+//
+// Does EVERYTHING: packs A and B, runs AMX tile loop, stores to C.
+// Eliminates all Rust↔C overhead and heap allocations.
+// For use by the persistent thread pool.
+void amx_sgemm_pack_and_compute(
+    const float* a, int lda,   // A[m×k], row-major stride lda
+    const float* b, int ldb,   // B[k×n], row-major stride ldb
+    float* c, int ldc,         // C[m×n], row-major stride ldc
+    int m, int k, int n,
+    int tile_start, int tile_end,  // tile index range for this worker
+    uint8_t* a_pack_buf,  // pre-allocated: enough for worker's A tiles
+    uint8_t* b_pack_buf,  // pre-allocated: enough for all B tiles
+    uint8_t* z_buf)       // pre-allocated: 16×64 bytes
+{
+    const int TILE = 16;
+    const int TILE_BYTES = 64;
+    int n_i_tiles = (m + TILE - 1) / TILE;
+    int n_j_tiles = (n + TILE - 1) / TILE;
+    
+    // Pack B tiles that this worker needs
+    // (Each worker packs all B tiles — they're shared/read-only and small enough)
+    for (int jt = 0; jt < n_j_tiles; jt++) {
+        int j_blk = jt * TILE;
+        int tile_n = TILE < (n - j_blk) ? TILE : (n - j_blk);
+        for (int kk = 0; kk < k; kk++) {
+            float* out = (float*)(b_pack_buf + (jt * k + kk) * TILE_BYTES);
+            const float* src = b + kk * ldb + j_blk;
+            __builtin_memcpy(out, src, tile_n * sizeof(float));
+            for (int jj = tile_n; jj < TILE; jj++)
+                out[jj] = 0.0f;
+        }
+    }
+    
+    // Process tiles in [tile_start..tile_end)
+    // For each i-tile, pack A once, then process all its j-tiles
+    int prev_it = -1;
+    for (int idx = tile_start; idx < tile_end; idx++) {
+        int it = idx / n_j_tiles;
+        int jt = idx % n_j_tiles;
+        int i_blk = it * TILE;
+        int j_blk = jt * TILE;
+        int tile_m = TILE < (m - i_blk) ? TILE : (m - i_blk);
+        int tile_n = TILE < (n - j_blk) ? TILE : (n - j_blk);
+        
+        // Pack A tile if we moved to a new i-tile
+        if (it != prev_it) {
+            // Column-gather: A[i_blk+ii, kk] → a_pack_buf[kk*TILE + ii]
+            float* ap_out = (float*)a_pack_buf;
+            for (int kk = 0; kk < k; kk++) {
+                for (int ii = 0; ii < tile_m; ii++)
+                    ap_out[kk * TILE + ii] = a[(i_blk + ii) * lda + kk];
+                for (int ii = tile_m; ii < TILE; ii++)
+                    ap_out[kk * TILE + ii] = 0.0f;
+            }
+            prev_it = it;
+        }
+        
+        const uint8_t* bp = b_pack_buf + jt * k * TILE_BYTES;
+        
+        amx_f32_tile_kernel_4y(a_pack_buf, bp, z_buf, k, tile_m);
+        
+        for (int ii = 0; ii < tile_m; ii++) {
+            const float* src = (const float*)(z_buf + ii * TILE_BYTES);
+            float* dst = c + (i_blk + ii) * ldc + j_blk;
+            __builtin_memcpy(dst, src, tile_n * sizeof(float));
+        }
+    }
+}
+
 // ── Strided AMX kernel (no pre-packing) ──────────────────────────────
 //
 // Computes C[m×n] += A[m×k] × B[k×n] directly from row-major strided
