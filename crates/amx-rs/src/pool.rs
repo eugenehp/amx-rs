@@ -179,6 +179,10 @@ mod inner {
         let active = nw.min(n_i_tiles);
         let rows_per = (n_i_tiles + active - 1) / active;
 
+        let active = nw.min(n_i_tiles);
+        let rows_per = (n_i_tiles + active - 1) / active;
+
+        // Write jobs: active workers get real work, inactive get empty range
         for i in 0..nw {
             let slot = &pool.slots[i];
             let job = &mut *slot.job.get();
@@ -192,15 +196,18 @@ mod inner {
                     m, k, n,
                     tile_start: start, tile_end: end,
                     b_ready_flag: 0,
-                    b_ready_gen: if direct_b { 1 } else { 0 }, // reused as direct_b flag
+                    b_ready_gen: if direct_b { 1 } else { 0 },
                 };
             } else {
-                *job = core::mem::zeroed();
+                // Empty job — just set tile range to empty
+                (*job).tile_start = 0;
+                (*job).tile_end = 0;
             }
         }
 
         let gen = pool.generation.fetch_add(1, Ordering::Release) + 1;
 
+        // Wait for ALL workers (they all must signal done before next dispatch)
         for i in 0..nw {
             let slot = &pool.slots[i];
             loop {

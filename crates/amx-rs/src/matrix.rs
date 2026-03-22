@@ -499,7 +499,9 @@ impl Matrix<f32> {
             return Err(AmxError::DimensionMismatch { expected: k, got: k2 });
         }
 
-        let mut c_data = vec![0.0f32; m * n];
+        // Allocate uninitialized — workers write all output tiles
+        let mut c_data = Vec::with_capacity(m * n);
+        unsafe { c_data.set_len(m * n); }
 
         unsafe {
             crate::pool::pool_sgemm(
