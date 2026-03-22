@@ -581,6 +581,9 @@ void amx_f32_tile_loop(
     }
 }
 
+// Forward declarations
+void neon_pack_a_tiles(const float* a, int m, int k, int start_it, int end_it, uint8_t* dst);
+
 // ── Complete sgemm in one C call (pack + compute) ────────────────────
 //
 // Does EVERYTHING: packs A and B, runs AMX tile loop, stores to C.
@@ -605,6 +608,8 @@ void amx_pack_b(const float* b, int ldb, int k, int n, uint8_t* dst) {
 }
 
 // Worker kernel: uses pre-packed B (shared), packs only its own A tiles.
+// Processes tiles grouped by i-row to maximize A-pack reuse.
+// KC-blocks the inner loop for L1 cache residency.
 void amx_sgemm_worker(
     const float* a, int lda,
     const uint8_t* b_packed,  // pre-packed B (shared across workers)
@@ -616,9 +621,12 @@ void amx_sgemm_worker(
 {
     const int TILE = 16;
     const int TILE_BYTES = 64;
+    const int KC = 512;
     int n_j_tiles = (n + TILE - 1) / TILE;
     
     int prev_it = -1;
+    int prev_tile_m = 0;
+    
     for (int idx = tile_start; idx < tile_end; idx++) {
         int it = idx / n_j_tiles;
         int jt = idx % n_j_tiles;
@@ -627,45 +635,61 @@ void amx_sgemm_worker(
         int tile_m = TILE < (m - i_blk) ? TILE : (m - i_blk);
         int tile_n = TILE < (n - j_blk) ? TILE : (n - j_blk);
         
-        if (it != prev_it) {
-            // NEON column-gather for A tile
-            const float* a_rows[16];
-            for (int ii = 0; ii < tile_m; ii++)
-                a_rows[ii] = a + (i_blk + ii) * lda;
+        if (k <= KC) {
+            // Small K: pack A once per i-tile, run single kernel
+            if (it != prev_it) {
+                neon_pack_a_tiles(a, m, lda, it, it + 1, a_pack_buf);
+                prev_it = it;
+                prev_tile_m = tile_m;
+            }
             
-            float* ap_out = (float*)a_pack_buf;
-            int kk = 0;
-            for (; kk + 3 < k; kk += 4) {
-                for (int ii = 0; ii < tile_m; ii++) {
-                    float32x4_t v = vld1q_f32(a_rows[ii] + kk);
-                    ap_out[(kk+0)*TILE + ii] = vgetq_lane_f32(v, 0);
-                    ap_out[(kk+1)*TILE + ii] = vgetq_lane_f32(v, 1);
-                    ap_out[(kk+2)*TILE + ii] = vgetq_lane_f32(v, 2);
-                    ap_out[(kk+3)*TILE + ii] = vgetq_lane_f32(v, 3);
+            const uint8_t* bp = b_packed + jt * k * TILE_BYTES;
+            amx_f32_tile_kernel_4y(a_pack_buf, bp, z_buf, k, tile_m);
+            
+            for (int ii = 0; ii < tile_m; ii++) {
+                const float* src = (const float*)(z_buf + ii * TILE_BYTES);
+                float* dst = c + (i_blk + ii) * ldc + j_blk;
+                __builtin_memcpy(dst, src, tile_n * sizeof(float));
+            }
+        } else {
+            // Large K: KC-blocked. Pack A in KC chunks, accumulate.
+            const uint8_t* bp_base = b_packed + jt * k * TILE_BYTES;
+            int first = 1;
+            
+            for (int kc = 0; kc < k; kc += KC) {
+                int actual_kc = KC < (k - kc) ? KC : (k - kc);
+                
+                // Pack A for this KC block
+                // Use the NEON packer with offset trick:
+                // We need A[i_blk..i_blk+tile_m, kc..kc+actual_kc]
+                // neon_pack_a_tiles expects full-width A with stride=lda
+                // Pack manually for KC sub-range:
+                {
+                    float* ap = (float*)a_pack_buf;
+                    const float* a_base = a + i_blk * lda + kc;
+                    for (int kkk = 0; kkk < actual_kc; kkk++) {
+                        for (int ii = 0; ii < tile_m; ii++)
+                            ap[kkk * TILE + ii] = a_base[ii * lda + kkk];
+                        for (int ii = tile_m; ii < TILE; ii++)
+                            ap[kkk * TILE + ii] = 0;
+                    }
                 }
-                for (int ii = tile_m; ii < TILE; ii++) {
-                    ap_out[(kk+0)*TILE + ii] = 0;
-                    ap_out[(kk+1)*TILE + ii] = 0;
-                    ap_out[(kk+2)*TILE + ii] = 0;
-                    ap_out[(kk+3)*TILE + ii] = 0;
+                
+                const uint8_t* bp = bp_base + kc * TILE_BYTES;
+                
+                if (first) {
+                    amx_f32_tile_kernel_4y(a_pack_buf, bp, z_buf, actual_kc, tile_m);
+                    first = 0;
+                } else {
+                    amx_f32_tile_kernel_4y_accum(a_pack_buf, bp, z_buf, actual_kc, tile_m);
                 }
             }
-            for (; kk < k; kk++) {
-                for (int ii = 0; ii < tile_m; ii++)
-                    ap_out[kk*TILE + ii] = a_rows[ii][kk];
-                for (int ii = tile_m; ii < TILE; ii++)
-                    ap_out[kk*TILE + ii] = 0;
+            
+            for (int ii = 0; ii < tile_m; ii++) {
+                const float* src = (const float*)(z_buf + ii * TILE_BYTES);
+                float* dst = c + (i_blk + ii) * ldc + j_blk;
+                __builtin_memcpy(dst, src, tile_n * sizeof(float));
             }
-            prev_it = it;
-        }
-        
-        const uint8_t* bp = b_packed + jt * k * TILE_BYTES;
-        amx_f32_tile_kernel_4y(a_pack_buf, bp, z_buf, k, tile_m);
-        
-        for (int ii = 0; ii < tile_m; ii++) {
-            const float* src = (const float*)(z_buf + ii * TILE_BYTES);
-            float* dst = c + (i_blk + ii) * ldc + j_blk;
-            __builtin_memcpy(dst, src, tile_n * sizeof(float));
         }
     }
 }

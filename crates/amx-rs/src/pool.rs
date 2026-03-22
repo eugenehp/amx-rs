@@ -157,8 +157,9 @@ mod inner {
             return;
         }
 
-        // Distribute tiles across workers
+        // Distribute tiles across workers only
         let tiles_per = (total_tiles + nw - 1) / nw;
+
         for i in 0..nw {
             let start = i * tiles_per;
             let end = ((i + 1) * tiles_per).min(total_tiles);
@@ -175,6 +176,7 @@ mod inner {
 
         let gen = pool.generation.fetch_add(1, Ordering::Release) + 1;
 
+        // Wait for workers
         for i in 0..nw {
             let slot = &pool.slots[i];
             loop {
