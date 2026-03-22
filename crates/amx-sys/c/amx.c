@@ -866,8 +866,70 @@ void amx_sgemm_worker(
         int i_blk = it * TILE;
         int tile_m = TILE < (m - i_blk) ? TILE : (m - i_blk);
         
-        // Zero-copy path: A is column-major, both A and B loaded directly
+        // Zero-copy with per-worker transpose: 
+        // Worker transposes its own 16 rows of A into a_pack_buf (column-major),
+        // then uses direct ldy (contiguous columns) + direct ldx (B rows).
+        // This replaces column-gather packing with a tiny local transpose.
         if (direct_b == 3) {
+            // Transpose this i-tile's rows: a_pack_buf[ii + kk*16] = A[i_blk+ii, kk]
+            // A is row-major: A[i,k] = a[i*lda + k]
+            float* at = (float*)a_pack_buf;
+            for (int kk = 0; kk < k; kk++)
+                for (int ii = 0; ii < tile_m; ii++)
+                    at[ii + kk * TILE] = a[(i_blk + ii) * lda + kk];
+            // Now at[ii + kk*16] is column-major: column kk = at[kk*16..kk*16+15] (contiguous!)
+            
+            int n_j_tiles_local = (n + TILE - 1) / TILE;
+            for (int jt = 0; jt < n_j_tiles_local; jt++) {
+                int j_blk = jt * TILE;
+                int tile_n_local = TILE < (n - j_blk) ? TILE : (n - j_blk);
+                
+                static const uint8_t zz[64] __attribute__((aligned(128))) = {0};
+                for (int r = 0; r < 16; r++)
+                    AMX_OP_GPR(4, (uint64_t)zz | ((uint64_t)(r*4) << 56));
+                
+                #define FMA32_Y_ZC2(row) ((uint64_t)(row) << 6)
+                int kk = 0;
+                for (; kk + 3 < k; kk += 4) {
+                    // ldy from transposed A: column kk = at[kk*16] (16 contiguous floats)
+                    AMX_OP_GPR(1, (uint64_t)(at + (kk+0)*TILE) | (0ULL << 56));
+                    AMX_OP_GPR(1, (uint64_t)(at + (kk+1)*TILE) | (1ULL << 56));
+                    AMX_OP_GPR(1, (uint64_t)(at + (kk+2)*TILE) | (2ULL << 56));
+                    AMX_OP_GPR(1, (uint64_t)(at + (kk+3)*TILE) | (3ULL << 56));
+                    // ldx from B directly
+                    AMX_OP_GPR(0, (uint64_t)(b + (kk+0)*ldb + j_blk));
+                    AMX_OP_GPR(12, FMA32_Y_ZC2(0));
+                    AMX_OP_GPR(0, (uint64_t)(b + (kk+1)*ldb + j_blk));
+                    AMX_OP_GPR(12, FMA32_Y_ZC2(1));
+                    AMX_OP_GPR(0, (uint64_t)(b + (kk+2)*ldb + j_blk));
+                    AMX_OP_GPR(12, FMA32_Y_ZC2(2));
+                    AMX_OP_GPR(0, (uint64_t)(b + (kk+3)*ldb + j_blk));
+                    AMX_OP_GPR(12, FMA32_Y_ZC2(3));
+                }
+                for (; kk < k; kk++) {
+                    AMX_OP_GPR(1, (uint64_t)(at + kk*TILE));
+                    AMX_OP_GPR(0, (uint64_t)(b + kk*ldb + j_blk));
+                    AMX_OP_GPR(12, 0);
+                }
+                #undef FMA32_Y_ZC2
+                
+                uint8_t* z_dst = z_buf + jt * tile_m * TILE_BYTES;
+                for (int r = 0; r < tile_m; r++)
+                    AMX_OP_GPR(5, ((uint64_t)(z_dst + r*64)) | ((uint64_t)(r*4) << 56));
+            }
+            // Bulk copy z_buf → C
+            for (int ii = 0; ii < tile_m; ii++)
+                for (int jt = 0; jt < n_j_tiles_local; jt++) {
+                    int j_blk = jt * TILE;
+                    int tile_n_local = TILE < (n - j_blk) ? TILE : (n - j_blk);
+                    __builtin_memcpy(c + (i_blk+ii)*ldc + j_blk,
+                        z_buf + (jt*tile_m + ii)*TILE_BYTES, tile_n_local*4);
+                }
+            continue;
+        }
+        
+        // Old zero-copy path (dead code, A was pre-transposed)
+        if (0 && direct_b == 3) {
             int n_j_tiles_local = (n + TILE - 1) / TILE;
             for (int jt = 0; jt < n_j_tiles_local; jt++) {
                 int j_blk = jt * TILE;

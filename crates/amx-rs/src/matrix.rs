@@ -319,15 +319,10 @@ impl Matrix<f32> {
 
                 #[cfg(feature = "std")]
                 {
-                    if n_i_tiles >= 8 {
-                        // Large enough for pool (≥128 rows)
-                        return self.matmul_pool(other);
-                    } else if n_i_tiles >= 2 && total_ops > 500_000 {
-                        // Medium (64-112): zerocopy single-thread
-                        // Transpose A once + direct compute is faster than
-                        // pool overhead for small matrices
-                        return self.matmul_zerocopy(other);
-                    } else if n_i_tiles >= 2 {
+                    if n_i_tiles >= 2 {
+                        // Pool with per-worker strategy:
+                        // N≤256, aligned: direct_b=3 (per-worker transpose, zero-pack)
+                        // N>256: direct_b=0 (pre-pack A+B, cache-friendly)
                         return self.matmul_pool(other);
                     } else {
                         return self.matmul_amx(other);
