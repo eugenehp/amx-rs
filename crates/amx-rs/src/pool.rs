@@ -16,6 +16,8 @@ mod inner {
 
     #[repr(C, align(128))]
     struct WorkerSlot {
+        /// Per-worker generation: dispatcher bumps to wake this specific worker
+        work_gen: AtomicU32,
         done_gen: AtomicU32,
         job: UnsafeCell<SgemmJob>,
         a_pack: *mut u8,
@@ -38,8 +40,6 @@ mod inner {
     struct AmxPool {
         slots: Vec<WorkerSlot>,
         n_workers: usize,
-        generation: AtomicU32,
-        b_ready: AtomicU32,  // bumped after B is packed
         b_pack: *mut u8,
         b_pack_size: usize,
     }
@@ -62,6 +62,7 @@ mod inner {
                     // z_buf sized for max n_j_tiles × 16 rows × 64 bytes
                     let z_sz = MAX_N_TILES * 16 * TILE_BYTES;
                     slots.push(WorkerSlot {
+                        work_gen: AtomicU32::new(0),
                         done_gen: AtomicU32::new(0),
                         job: UnsafeCell::new(core::mem::zeroed()),
                         a_pack: aligned_alloc(a_sz, 128),
@@ -71,8 +72,6 @@ mod inner {
 
                 let pool = Box::leak(Box::new(AmxPool {
                     slots, n_workers,
-                    generation: AtomicU32::new(0),
-                    b_ready: AtomicU32::new(0),
                     b_pack: aligned_alloc(b_pack_size, 128),
                     b_pack_size,
                 }));
@@ -102,8 +101,9 @@ mod inner {
 
         let mut my_gen = 0u32;
         loop {
+            // Spin on THIS worker's per-worker generation
             loop {
-                let g = pool.generation.load(Ordering::Relaxed);
+                let g = slot.work_gen.load(Ordering::Relaxed);
                 if g > my_gen { my_gen = g; break; }
                 core::hint::spin_loop();
             }
@@ -179,33 +179,34 @@ mod inner {
         let active = nw.min(n_i_tiles);
         let rows_per = (n_i_tiles + active - 1) / active;
 
-        for i in 0..nw {
+        // Write jobs ONLY to active workers
+        for i in 0..active {
             let slot = &pool.slots[i];
             let job = &mut *slot.job.get();
-            if i < active {
-                let start = i * rows_per;
-                let end = ((i + 1) * rows_per).min(n_i_tiles);
-                *job = SgemmJob {
-                    a: a as usize, lda,
-                    b_packed: if direct_b { b as usize } else { pool.b_pack as usize },
-                    c: c as usize, ldc,
-                    m, k, n,
-                    tile_start: start, tile_end: end,
-                    b_ready_flag: 0,
-                    b_ready_gen: if direct_b { 1 } else { 0 },
-                };
-            } else {
-                (*job).tile_start = 0;
-                (*job).tile_end = 0;
-            }
+            let start = i * rows_per;
+            let end = ((i + 1) * rows_per).min(n_i_tiles);
+            *job = SgemmJob {
+                a: a as usize, lda,
+                b_packed: if direct_b { b as usize } else { pool.b_pack as usize },
+                c: c as usize, ldc,
+                m, k, n,
+                tile_start: start, tile_end: end,
+                b_ready_flag: 0,
+                b_ready_gen: if direct_b { 1 } else { 0 },
+            };
         }
 
-        let gen = pool.generation.fetch_add(1, Ordering::Release) + 1;
+        // Bump ONLY active workers' per-worker generations
+        for i in 0..active {
+            pool.slots[i].work_gen.fetch_add(1, Ordering::Release);
+        }
 
-        for i in 0..nw {
+        // Wait ONLY for active workers
+        for i in 0..active {
             let slot = &pool.slots[i];
+            let target = slot.work_gen.load(Ordering::Relaxed);
             loop {
-                if slot.done_gen.load(Ordering::Acquire) >= gen { break; }
+                if slot.done_gen.load(Ordering::Acquire) >= target { break; }
                 core::hint::spin_loop();
             }
         }
