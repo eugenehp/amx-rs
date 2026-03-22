@@ -93,16 +93,43 @@ impl<T: Clone + Default> Vector<T> {
 impl Vector<f32> {
     /// Dot product using the best available backend.
     ///
-    /// Uses AMX hardware on `aarch64` Apple Silicon if available,
-    /// Kahan-compensated scalar otherwise for best precision.
+    /// Uses NEON hardware acceleration on `aarch64` Apple Silicon (faster than AMX
+    /// for dot products due to lower setup overhead), Kahan-compensated scalar
+    /// otherwise for best precision.
     pub fn dot(&self, other: &Vector<f32>) -> AmxResult<f32> {
         #[cfg(target_arch = "aarch64")]
         {
             if amx_sys::is_amx_available() {
-                return self.dot_amx(other);
+                return self.dot_neon(other);
             }
         }
         self.dot_kahan(other)
+    }
+
+    /// NEON-accelerated dot product.
+    ///
+    /// Uses NEON SIMD with 4-way parallel accumulators and 16-float unrolling.
+    /// Significantly faster than AMX for dot products due to lower setup overhead.
+    ///
+    /// Only available on `aarch64`.
+    #[cfg(target_arch = "aarch64")]
+    pub fn dot_neon(&self, other: &Vector<f32>) -> AmxResult<f32> {
+        if self.len() != other.len() {
+            return Err(AmxError::DimensionMismatch {
+                expected: self.len(),
+                got: other.len(),
+            });
+        }
+
+        let a = self.as_slice();
+        let b = other.as_slice();
+        let n = a.len();
+
+        let result = unsafe {
+            amx_sys::neon_f32_dot(a.as_ptr(), b.as_ptr(), n as i32)
+        };
+
+        Ok(result)
     }
 
     /// Scalar (pure-Rust) dot product.

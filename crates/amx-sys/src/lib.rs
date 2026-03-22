@@ -82,6 +82,31 @@ extern "C" {
     // Complete dot product: set, zero, accumulate, reduce, clr.
     // Single FFI call for the entire operation.
     pub fn amx_f32_dot(a: *const f32, b: *const f32, n: i32) -> f32;
+
+    // NEON-accelerated functions (faster than AMX for small operations)
+
+    /// NEON-vectorized A packing: significantly faster than scalar column-gather.
+    pub fn neon_pack_a_tiles(
+        a: *const f32, m: i32, k: i32,
+        start_it: i32, end_it: i32, dst: *mut u8,
+    );
+
+    /// NEON small matrix multiply: M×K × K×N → M×N.
+    /// Optimal for N ≤ 32, bypasses AMX entirely.
+    pub fn neon_f32_matmul_small(
+        a: *const f32, b: *const f32, c: *mut f32,
+        m: i32, k: i32, n: i32,
+    );
+
+    /// NEON tiled matrix multiply with 8×8 tiling.
+    /// Good for N ≤ 64.
+    pub fn neon_f32_matmul_tiled(
+        a: *const f32, b: *const f32, c: *mut f32,
+        m: i32, k: i32, n: i32,
+    );
+
+    /// NEON f32 dot product — much faster than AMX for this operation.
+    pub fn neon_f32_dot(a: *const f32, b: *const f32, n: i32) -> f32;
 }
 
 /// Returns `true` if AMX instructions are available on this CPU.

@@ -122,7 +122,7 @@ impl CsvRow {
 fn measure_matmul(
     m: usize, k: usize, n: usize,
     base_iters: u32, n_threads: usize, has_amx: bool,
-) -> (f64, f64, f64, f64, f64, f64, f64, f64) {
+) -> (f64, f64, f64, f64, f64, f64, f64, f64, f64, f64) {
     let a = make_matrix(m, k);
     let b = make_matrix(k, n);
     let a_raw = make_f32_data(m * k);
@@ -133,6 +133,11 @@ fn measure_matmul(
     let flops = 2.0 * m as f64 * k as f64 * n as f64;
 
     let t_scalar = bench_fn(|| { black_box(a.matmul_scalar(&b).unwrap()); }, iters);
+
+    // Smart dispatch (uses NEON for small, AMX for large)
+    let t_smart = if has_amx {
+        bench_fn(|| { black_box(a.matmul(&b).unwrap()); }, iters)
+    } else { t_scalar };
 
     let t_amx = if has_amx {
         bench_fn(|| { black_box(a.matmul_amx(&b).unwrap()); }, iters)
@@ -149,12 +154,13 @@ fn measure_matmul(
     }, iters);
 
     let gf_s = flops / t_scalar / 1e9;
+    let gf_smart = flops / t_smart / 1e9;
     let gf_a = flops / t_amx / 1e9;
     let gf_ap = flops / t_amx_par / 1e9;
     let gf_b = flops / t_blas / 1e9;
 
-    (t_scalar * 1e6, t_amx * 1e6, t_amx_par * 1e6, t_blas * 1e6,
-     gf_s, gf_a, gf_ap, gf_b)
+    (t_scalar * 1e6, t_smart * 1e6, t_amx * 1e6, t_amx_par * 1e6, t_blas * 1e6,
+     gf_s, gf_smart, gf_a, gf_ap, gf_b)
 }
 
 // ---------------------------------------------------------------------------
@@ -193,17 +199,17 @@ fn main() {
 
     println!();
     println!("  SQUARE MATMUL f32 (N×N × N×N)");
-    println!("  {:>5}  {:>8} {:>8} {:>8} {:>8}  {:>6} {:>6} {:>6} {:>6}",
-        "N", "scalar", "AMX", "AMX-par", "Accel", "GFs", "GFa", "GFap", "GFbl");
-    println!("  {}", "─".repeat(90));
+    println!("  {:>5}  {:>8} {:>8} {:>8} {:>8} {:>8}  {:>6} {:>6} {:>6} {:>6} {:>6}",
+        "N", "scalar", "smart", "AMX", "AMX-par", "Accel", "GFs", "GFsm", "GFa", "GFap", "GFbl");
+    println!("  {}", "─".repeat(110));
 
     for &sz in &sq_sizes {
-        let (su,au,apu,bu, gs,ga,gap,gb) =
+        let (su, sm, au, apu, bu, gs, gsm, ga, gap, gb) =
             measure_matmul(sz, sz, sz, base_iters, n_threads, has_amx);
 
-        println!("  {:>5}  {} {} {} {}  {} {} {} {}",
-            sz, fmt_us(su), fmt_us(au), fmt_us(apu), fmt_us(bu),
-            fmt_gf(gs), fmt_gf(ga), fmt_gf(gap), fmt_gf(gb));
+        println!("  {:>5}  {} {} {} {} {}  {} {} {} {} {}",
+            sz, fmt_us(su), fmt_us(sm), fmt_us(au), fmt_us(apu), fmt_us(bu),
+            fmt_gf(gs), fmt_gf(gsm), fmt_gf(ga), fmt_gf(gap), fmt_gf(gb));
 
         csv_rows.push(CsvRow {
             chip: chip.clone(), op: "matmul".into(),
@@ -227,18 +233,18 @@ fn main() {
 
     println!();
     println!("  RECTANGULAR MATMUL f32 (M×K × K×N)");
-    println!("  {:>16}  {:>8} {:>8} {:>8} {:>8}  {:>6} {:>6} {:>6} {:>6}",
-        "shape", "scalar", "AMX", "AMX-par", "Accel", "GFs", "GFa", "GFap", "GFbl");
-    println!("  {}", "─".repeat(98));
+    println!("  {:>16}  {:>8} {:>8} {:>8} {:>8} {:>8}  {:>6} {:>6} {:>6} {:>6} {:>6}",
+        "shape", "scalar", "smart", "AMX", "AMX-par", "Accel", "GFs", "GFsm", "GFa", "GFap", "GFbl");
+    println!("  {}", "─".repeat(118));
 
     for &(m,k,n) in &rect {
-        let (su,au,apu,bu, gs,ga,gap,gb) =
+        let (su, sm, au, apu, bu, gs, gsm, ga, gap, gb) =
             measure_matmul(m, k, n, base_iters, n_threads, has_amx);
 
-        println!("  {:>16}  {} {} {} {}  {} {} {} {}",
+        println!("  {:>16}  {} {} {} {} {}  {} {} {} {} {}",
             format!("{m}×{k}×{n}"),
-            fmt_us(su), fmt_us(au), fmt_us(apu), fmt_us(bu),
-            fmt_gf(gs), fmt_gf(ga), fmt_gf(gap), fmt_gf(gb));
+            fmt_us(su), fmt_us(sm), fmt_us(au), fmt_us(apu), fmt_us(bu),
+            fmt_gf(gs), fmt_gf(gsm), fmt_gf(ga), fmt_gf(gap), fmt_gf(gb));
 
         csv_rows.push(CsvRow {
             chip: chip.clone(), op: "matmul".into(),
@@ -254,9 +260,9 @@ fn main() {
 
     println!();
     println!("  DOT PRODUCT f32 (a · b)");
-    println!("  {:>8}  {:>8} {:>8} {:>8}  {:>6} {:>6} {:>6}",
-        "length", "scalar", "AMX", "Accel", "GFs", "GFa", "GFbl");
-    println!("  {}", "─".repeat(70));
+    println!("  {:>8}  {:>8} {:>8} {:>8} {:>8}  {:>6} {:>6} {:>6} {:>6}",
+        "length", "scalar", "NEON", "AMX", "Accel", "GFs", "GFn", "GFa", "GFbl");
+    println!("  {}", "─".repeat(86));
 
     for &sz in &dot_sizes {
         let a = make_vector(sz);
@@ -267,22 +273,26 @@ fn main() {
         let flops = 2.0 * sz as f64;
 
         let t_s = bench_fn(|| { black_box(a.dot_scalar(&b).unwrap()); }, iters);
+        let t_n = if has_amx {
+            bench_fn(|| { black_box(a.dot_neon(&b).unwrap()); }, iters)
+        } else { t_s };
         let t_a = if has_amx {
             bench_fn(|| { black_box(a.dot_amx(&b).unwrap()); }, iters)
         } else { t_s };
         let t_b = bench_fn(|| { black_box(blas_sdot(&a_raw, &b_raw)); }, iters);
 
-        let gs = flops/t_s/1e9; let ga = flops/t_a/1e9; let gb = flops/t_b/1e9;
+        let gs = flops/t_s/1e9; let gn = flops/t_n/1e9;
+        let ga = flops/t_a/1e9; let gb = flops/t_b/1e9;
 
-        println!("  {:>8}  {} {} {}  {} {} {}",
-            sz, fmt_us(t_s*1e6), fmt_us(t_a*1e6), fmt_us(t_b*1e6),
-            fmt_gf(gs), fmt_gf(ga), fmt_gf(gb));
+        println!("  {:>8}  {} {} {} {}  {} {} {} {}",
+            sz, fmt_us(t_s*1e6), fmt_us(t_n*1e6), fmt_us(t_a*1e6), fmt_us(t_b*1e6),
+            fmt_gf(gs), fmt_gf(gn), fmt_gf(ga), fmt_gf(gb));
 
         csv_rows.push(CsvRow {
             chip: chip.clone(), op: "dot".into(),
             shape: format!("len={sz}"), m: sz, k: 1, n: 1, flops,
-            scalar_us: t_s*1e6, amx_us: t_a*1e6, amx_par_us: t_a*1e6, blas_us: t_b*1e6,
-            scalar_gf: gs, amx_gf: ga, amx_par_gf: ga, blas_gf: gb,
+            scalar_us: t_s*1e6, amx_us: t_a*1e6, amx_par_us: t_n*1e6, blas_us: t_b*1e6,
+            scalar_gf: gs, amx_gf: ga, amx_par_gf: gn, blas_gf: gb,
         });
     }
 

@@ -256,6 +256,264 @@ void amx_f32_tile_kernel_accum(const void* a_panel, const void* b_panel,
     }
 }
 
+// ── NEON kernels ─────────────────────────────────────────────────────
+
+#include <arm_neon.h>
+
+// NEON-vectorized A packing: gather columns into 64-byte vectors.
+// For each k, gathers A[i_blk+0..tile_m-1, k] into dst[k*64..k*64+tile_m*4-1].
+// Uses NEON vld1q_lane_f32 for 4-wide gathers when possible.
+void neon_pack_a_tile(const float* a, int m, int k, int i_blk, int tile_m,
+                      uint8_t* dst) {
+    (void)m;  // unused but kept for API consistency
+    // a is row-major: A[i,j] = a[i*k + j]
+    // For each kk, we need to gather A[i_blk+ii, kk] for ii in 0..tile_m
+    // That's elements at offsets: (i_blk+0)*k+kk, (i_blk+1)*k+kk, ...
+    
+    // Precompute row pointers
+    const float* rows[16];
+    for (int ii = 0; ii < tile_m; ii++) {
+        rows[ii] = a + (i_blk + ii) * k;
+    }
+    
+    float* out = (float*)dst;
+    
+    // Process 4 k-values at a time using NEON
+    int kk = 0;
+    for (; kk + 3 < k; kk += 4) {
+        for (int ii = 0; ii < tile_m; ii++) {
+            // Load 4 consecutive k values from this row
+            float32x4_t v = vld1q_f32(rows[ii] + kk);
+            // Store transposed: each k goes to a different output vector
+            out[(kk+0)*16 + ii] = vgetq_lane_f32(v, 0);
+            out[(kk+1)*16 + ii] = vgetq_lane_f32(v, 1);
+            out[(kk+2)*16 + ii] = vgetq_lane_f32(v, 2);
+            out[(kk+3)*16 + ii] = vgetq_lane_f32(v, 3);
+        }
+    }
+    // Remainder
+    for (; kk < k; kk++) {
+        for (int ii = 0; ii < tile_m; ii++) {
+            out[kk*16 + ii] = rows[ii][kk];
+        }
+    }
+}
+
+// Pack multiple A tiles with NEON acceleration.
+// Packs tiles [start_it..end_it) into dst.
+void neon_pack_a_tiles(const float* a, int m, int k,
+                       int start_it, int end_it, uint8_t* dst) {
+    const int TILE = 16;
+    const int TILE_BYTES = 64;
+    
+    for (int it_local = 0; it_local < (end_it - start_it); it_local++) {
+        int it = start_it + it_local;
+        int i_blk = it * TILE;
+        int tile_m = TILE < (m - i_blk) ? TILE : (m - i_blk);
+        
+        uint8_t* tile_dst = dst + it_local * k * TILE_BYTES;
+        neon_pack_a_tile(a, m, k, i_blk, tile_m, tile_dst);
+    }
+}
+
+// NEON small matrix multiply: 4×K × K×4 → 4×4 micro-kernel.
+// Uses 4 accumulators, fully vectorized.
+static inline void neon_gemm_4x4(const float* a, const float* b, float* c,
+                                  int k, int lda, int ldb, int ldc) {
+    float32x4_t c0 = vdupq_n_f32(0);
+    float32x4_t c1 = vdupq_n_f32(0);
+    float32x4_t c2 = vdupq_n_f32(0);
+    float32x4_t c3 = vdupq_n_f32(0);
+    
+    for (int kk = 0; kk < k; kk++) {
+        float32x4_t b_row = vld1q_f32(b + kk * ldb);
+        
+        c0 = vfmaq_n_f32(c0, b_row, a[0 * lda + kk]);
+        c1 = vfmaq_n_f32(c1, b_row, a[1 * lda + kk]);
+        c2 = vfmaq_n_f32(c2, b_row, a[2 * lda + kk]);
+        c3 = vfmaq_n_f32(c3, b_row, a[3 * lda + kk]);
+    }
+    
+    vst1q_f32(c + 0 * ldc, c0);
+    vst1q_f32(c + 1 * ldc, c1);
+    vst1q_f32(c + 2 * ldc, c2);
+    vst1q_f32(c + 3 * ldc, c3);
+}
+
+// NEON small matmul for N ≤ 32: M×K × K×N → M×N.
+// Tiles in 4×4 blocks, handles fringe with scalar.
+// This bypasses AMX entirely for small matrices.
+void neon_f32_matmul_small(const float* a, const float* b, float* c,
+                           int m, int k, int n) {
+    // Zero output
+    for (int i = 0; i < m * n; i++) c[i] = 0;
+    
+    // Process 4×4 tiles
+    int m4 = m & ~3;
+    int n4 = n & ~3;
+    
+    for (int i = 0; i < m4; i += 4) {
+        for (int j = 0; j < n4; j += 4) {
+            neon_gemm_4x4(a + i * k, b + j, c + i * n + j, k, k, n, n);
+        }
+    }
+    
+    // Right fringe (j >= n4)
+    for (int i = 0; i < m4; i += 4) {
+        for (int j = n4; j < n; j++) {
+            for (int ii = 0; ii < 4; ii++) {
+                float sum = 0;
+                for (int kk = 0; kk < k; kk++) {
+                    sum += a[(i + ii) * k + kk] * b[kk * n + j];
+                }
+                c[(i + ii) * n + j] = sum;
+            }
+        }
+    }
+    
+    // Bottom fringe (i >= m4)
+    for (int i = m4; i < m; i++) {
+        for (int j = 0; j < n; j++) {
+            float sum = 0;
+            for (int kk = 0; kk < k; kk++) {
+                sum += a[i * k + kk] * b[kk * n + j];
+            }
+            c[i * n + j] = sum;
+        }
+    }
+}
+
+// NEON-optimized small matmul with 8×8 tiling for better register usage.
+// Handles M,N ≤ 64 efficiently.
+void neon_f32_matmul_tiled(const float* a, const float* b, float* c,
+                            int m, int k, int n) {
+    // Zero output
+    for (int i = 0; i < m * n; i++) c[i] = 0;
+    
+    // 8×8 outer tiles
+    const int TILE_M = 8;
+    const int TILE_N = 8;
+    
+    for (int i0 = 0; i0 < m; i0 += TILE_M) {
+        int tile_m = (i0 + TILE_M <= m) ? TILE_M : (m - i0);
+        
+        for (int j0 = 0; j0 < n; j0 += TILE_N) {
+            int tile_n = (j0 + TILE_N <= n) ? TILE_N : (n - j0);
+            
+            // Accumulate this tile
+            // Use 4×4 micro-kernels if possible
+            if (tile_m >= 4 && tile_n >= 4) {
+                // 4×4 tiles within 8×8
+                for (int di = 0; di < tile_m; di += 4) {
+                    int mm = (di + 4 <= tile_m) ? 4 : (tile_m - di);
+                    for (int dj = 0; dj < tile_n; dj += 4) {
+                        int nn = (dj + 4 <= tile_n) ? 4 : (tile_n - dj);
+                        
+                        if (mm == 4 && nn == 4) {
+                            // Full 4×4 tile
+                            float32x4_t acc[4] = {
+                                vld1q_f32(c + (i0 + di + 0) * n + j0 + dj),
+                                vld1q_f32(c + (i0 + di + 1) * n + j0 + dj),
+                                vld1q_f32(c + (i0 + di + 2) * n + j0 + dj),
+                                vld1q_f32(c + (i0 + di + 3) * n + j0 + dj)
+                            };
+                            
+                            for (int kk = 0; kk < k; kk++) {
+                                float32x4_t b_row = vld1q_f32(b + kk * n + j0 + dj);
+                                acc[0] = vfmaq_n_f32(acc[0], b_row, a[(i0 + di + 0) * k + kk]);
+                                acc[1] = vfmaq_n_f32(acc[1], b_row, a[(i0 + di + 1) * k + kk]);
+                                acc[2] = vfmaq_n_f32(acc[2], b_row, a[(i0 + di + 2) * k + kk]);
+                                acc[3] = vfmaq_n_f32(acc[3], b_row, a[(i0 + di + 3) * k + kk]);
+                            }
+                            
+                            vst1q_f32(c + (i0 + di + 0) * n + j0 + dj, acc[0]);
+                            vst1q_f32(c + (i0 + di + 1) * n + j0 + dj, acc[1]);
+                            vst1q_f32(c + (i0 + di + 2) * n + j0 + dj, acc[2]);
+                            vst1q_f32(c + (i0 + di + 3) * n + j0 + dj, acc[3]);
+                        } else {
+                            // Scalar for small fringes
+                            for (int ii = 0; ii < mm; ii++) {
+                                for (int jj = 0; jj < nn; jj++) {
+                                    float sum = c[(i0 + di + ii) * n + j0 + dj + jj];
+                                    for (int kk = 0; kk < k; kk++) {
+                                        sum += a[(i0 + di + ii) * k + kk] * b[kk * n + j0 + dj + jj];
+                                    }
+                                    c[(i0 + di + ii) * n + j0 + dj + jj] = sum;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Pure scalar for tiny tiles
+                for (int ii = 0; ii < tile_m; ii++) {
+                    for (int jj = 0; jj < tile_n; jj++) {
+                        float sum = c[(i0 + ii) * n + j0 + jj];
+                        for (int kk = 0; kk < k; kk++) {
+                            sum += a[(i0 + ii) * k + kk] * b[kk * n + j0 + jj];
+                        }
+                        c[(i0 + ii) * n + j0 + jj] = sum;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// NEON f32 dot product — much faster than AMX for dot product.
+// Uses 4-way parallel accumulation with 4× unrolling.
+float neon_f32_dot(const float* a, const float* b, int n) {
+    float32x4_t sum0 = vdupq_n_f32(0);
+    float32x4_t sum1 = vdupq_n_f32(0);
+    float32x4_t sum2 = vdupq_n_f32(0);
+    float32x4_t sum3 = vdupq_n_f32(0);
+    
+    int i = 0;
+    
+    // Main loop: 16 floats per iteration (4 vectors × 4 floats)
+    for (; i + 15 < n; i += 16) {
+        float32x4_t a0 = vld1q_f32(a + i);
+        float32x4_t a1 = vld1q_f32(a + i + 4);
+        float32x4_t a2 = vld1q_f32(a + i + 8);
+        float32x4_t a3 = vld1q_f32(a + i + 12);
+        
+        float32x4_t b0 = vld1q_f32(b + i);
+        float32x4_t b1 = vld1q_f32(b + i + 4);
+        float32x4_t b2 = vld1q_f32(b + i + 8);
+        float32x4_t b3 = vld1q_f32(b + i + 12);
+        
+        sum0 = vfmaq_f32(sum0, a0, b0);
+        sum1 = vfmaq_f32(sum1, a1, b1);
+        sum2 = vfmaq_f32(sum2, a2, b2);
+        sum3 = vfmaq_f32(sum3, a3, b3);
+    }
+    
+    // Handle 4-float chunks
+    for (; i + 3 < n; i += 4) {
+        float32x4_t av = vld1q_f32(a + i);
+        float32x4_t bv = vld1q_f32(b + i);
+        sum0 = vfmaq_f32(sum0, av, bv);
+    }
+    
+    // Combine accumulators
+    sum0 = vaddq_f32(sum0, sum1);
+    sum2 = vaddq_f32(sum2, sum3);
+    sum0 = vaddq_f32(sum0, sum2);
+    
+    // Horizontal sum
+    float32x2_t sum_low = vget_low_f32(sum0);
+    float32x2_t sum_high = vget_high_f32(sum0);
+    float32x2_t sum_pair = vadd_f32(sum_low, sum_high);
+    float result = vget_lane_f32(vpadd_f32(sum_pair, sum_pair), 0);
+    
+    // Scalar tail
+    for (; i < n; i++) {
+        result += a[i] * b[i];
+    }
+    
+    return result;
+}
+
 // ── f32 dot product kernel ───────────────────────────────────────────
 //
 // Complete dot product in a single FFI call: set, zero, accumulate,
