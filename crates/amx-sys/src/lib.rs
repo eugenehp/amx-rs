@@ -111,6 +111,16 @@ extern "C" {
     /// Pack B tiles into contiguous layout.
     pub fn amx_pack_b(b: *const f32, ldb: i32, k: i32, n: i32, dst: *mut u8);
 
+    /// GCD-based parallel sgemm. Uses dispatch_apply for ~170ns dispatch.
+    pub fn amx_sgemm_gcd(
+        a: *const f32, lda: i32,
+        b: *const f32, ldb: i32,
+        c: *mut f32, ldc: i32,
+        m: i32, k: i32, n: i32,
+        direct_b: i32,
+        n_blocks: i32,
+    );
+
     /// Specialized 64×64 sgemm — single C call, zero dispatch overhead.
     pub fn sgemm_64x64(
         a: *const f32, b: *const f32, c: *mut f32,

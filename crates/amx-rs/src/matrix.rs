@@ -392,14 +392,15 @@ impl Matrix<f32> {
                             let (a_col, a_stride) = self.ensure_col_cache();
                             let mut c_data = Vec::with_capacity(m * n);
                             unsafe { c_data.set_len(m * n); }
-                            // Dispatch to pool with explicit direct_b=4 flag
+                            // Use spin pool with direct_b=4 (column-major A)
+                            // Spin pool has pre-allocated buffers + permanent amx_set
                             unsafe {
                                 crate::pool::pool_sgemm_with_flag(
                                     a_col, a_stride,
                                     b_ptr, n,
                                     c_data.as_mut_ptr(), n,
                                     m, k, n,
-                                    4, // direct_b=4: column-major A, direct B
+                                    4,
                                 );
                             }
                             return Matrix::from_data(c_data, m, n);

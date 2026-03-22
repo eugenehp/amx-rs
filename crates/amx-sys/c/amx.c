@@ -634,6 +634,62 @@ void sgemm_64x64(
     }
 }
 
+// Forward declaration for GCD
+void amx_sgemm_worker(const float* a, int lda, const float* b, int ldb,
+    float* c, int ldc, int m, int k, int n,
+    int irow_start, int irow_end, uint8_t* a_pack_buf, uint8_t* z_buf, int direct_b);
+
+// ── GCD-based parallel sgemm (macOS) ────────────────────────────────
+#include <dispatch/dispatch.h>
+
+// GCD parallel sgemm: uses dispatch_apply for near-zero dispatch overhead.
+// Each block processes a range of i-tile rows.
+void amx_sgemm_gcd(
+    const float* a, int lda,
+    const float* b, int ldb,
+    float* c, int ldc,
+    int m, int k, int n,
+    int direct_b,    // 1=direct B, 4=column-major A
+    int n_blocks)    // number of parallel blocks (like Apple's thread count)
+{
+    const int TILE = 16;
+    const int TILE_BYTES = 64;
+    int n_i_tiles = (m + TILE - 1) / TILE;
+    
+    if (n_blocks <= 1 || n_i_tiles < 2) {
+        n_blocks = 1;
+    }
+    if (n_blocks > n_i_tiles) n_blocks = n_i_tiles;
+    
+    int rows_per = (n_i_tiles + n_blocks - 1) / n_blocks;
+    
+    dispatch_queue_t q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
+    
+    dispatch_apply(n_blocks, q, ^(size_t block_idx) {
+        int start = (int)block_idx * rows_per;
+        int end = start + rows_per;
+        if (end > n_i_tiles) end = n_i_tiles;
+        if (start >= end) return;
+        
+        // Per-block scratch buffers — heap allocated to avoid stack overflow
+        int n_j_tiles = (n + TILE - 1) / TILE;
+        int a_sz = k * 64;  // just 1 tile row worth
+        int z_sz = n_j_tiles * 16 * 64;
+        uint8_t* a_pack = (uint8_t*)aligned_alloc(128, a_sz > 0 ? a_sz : 128);
+        uint8_t* z_buf = (uint8_t*)aligned_alloc(128, z_sz > 0 ? z_sz : 128);
+        
+        // AMX set/clr per GCD block — can't avoid this with dispatch_apply
+        // since GCD blocks run on different threads each time
+        AMX_NOP_OP_IMM5(17, 0);
+        amx_sgemm_worker(a, lda, b, ldb,
+            c, ldc, m, k, n, start, end,
+            a_pack, z_buf, direct_b);
+        AMX_NOP_OP_IMM5(17, 1);
+        free(a_pack);
+        free(z_buf);
+    });
+}
+
 // Forward declarations
 void neon_pack_a_tiles(const float* a, int m, int k, int start_it, int end_it, uint8_t* dst);
 
