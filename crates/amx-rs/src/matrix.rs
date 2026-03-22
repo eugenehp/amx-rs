@@ -319,7 +319,7 @@ impl Matrix<f32> {
 
                 #[cfg(feature = "std")]
                 {
-                    if total_tiles >= 16 {
+                    if total_tiles >= 64 {
                         // Pool: single C tile-loop call per worker, near-zero overhead
                         return self.matmul_pool(other);
                     } else {

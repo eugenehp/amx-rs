@@ -586,37 +586,38 @@ void amx_f32_tile_loop(
 // Does EVERYTHING: packs A and B, runs AMX tile loop, stores to C.
 // Eliminates all Rust↔C overhead and heap allocations.
 // For use by the persistent thread pool.
-void amx_sgemm_pack_and_compute(
-    const float* a, int lda,   // A[m×k], row-major stride lda
-    const float* b, int ldb,   // B[k×n], row-major stride ldb
-    float* c, int ldc,         // C[m×n], row-major stride ldc
-    int m, int k, int n,
-    int tile_start, int tile_end,  // tile index range for this worker
-    uint8_t* a_pack_buf,  // pre-allocated: enough for worker's A tiles
-    uint8_t* b_pack_buf,  // pre-allocated: enough for all B tiles
-    uint8_t* z_buf)       // pre-allocated: 16×64 bytes
-{
+// Pack B tiles into contiguous layout for AMX ldx.
+void amx_pack_b(const float* b, int ldb, int k, int n, uint8_t* dst) {
     const int TILE = 16;
     const int TILE_BYTES = 64;
-    int n_i_tiles = (m + TILE - 1) / TILE;
     int n_j_tiles = (n + TILE - 1) / TILE;
-    
-    // Pack B tiles that this worker needs
-    // (Each worker packs all B tiles — they're shared/read-only and small enough)
     for (int jt = 0; jt < n_j_tiles; jt++) {
         int j_blk = jt * TILE;
         int tile_n = TILE < (n - j_blk) ? TILE : (n - j_blk);
         for (int kk = 0; kk < k; kk++) {
-            float* out = (float*)(b_pack_buf + (jt * k + kk) * TILE_BYTES);
+            float* out = (float*)(dst + (jt * k + kk) * TILE_BYTES);
             const float* src = b + kk * ldb + j_blk;
             __builtin_memcpy(out, src, tile_n * sizeof(float));
             for (int jj = tile_n; jj < TILE; jj++)
                 out[jj] = 0.0f;
         }
     }
+}
+
+// Worker kernel: uses pre-packed B (shared), packs only its own A tiles.
+void amx_sgemm_worker(
+    const float* a, int lda,
+    const uint8_t* b_packed,  // pre-packed B (shared across workers)
+    float* c, int ldc,
+    int m, int k, int n,
+    int tile_start, int tile_end,
+    uint8_t* a_pack_buf,
+    uint8_t* z_buf)
+{
+    const int TILE = 16;
+    const int TILE_BYTES = 64;
+    int n_j_tiles = (n + TILE - 1) / TILE;
     
-    // Process tiles in [tile_start..tile_end)
-    // For each i-tile, pack A once, then process all its j-tiles
     int prev_it = -1;
     for (int idx = tile_start; idx < tile_end; idx++) {
         int it = idx / n_j_tiles;
@@ -626,21 +627,39 @@ void amx_sgemm_pack_and_compute(
         int tile_m = TILE < (m - i_blk) ? TILE : (m - i_blk);
         int tile_n = TILE < (n - j_blk) ? TILE : (n - j_blk);
         
-        // Pack A tile if we moved to a new i-tile
         if (it != prev_it) {
-            // Column-gather: A[i_blk+ii, kk] → a_pack_buf[kk*TILE + ii]
+            // NEON column-gather for A tile
+            const float* a_rows[16];
+            for (int ii = 0; ii < tile_m; ii++)
+                a_rows[ii] = a + (i_blk + ii) * lda;
+            
             float* ap_out = (float*)a_pack_buf;
-            for (int kk = 0; kk < k; kk++) {
+            int kk = 0;
+            for (; kk + 3 < k; kk += 4) {
+                for (int ii = 0; ii < tile_m; ii++) {
+                    float32x4_t v = vld1q_f32(a_rows[ii] + kk);
+                    ap_out[(kk+0)*TILE + ii] = vgetq_lane_f32(v, 0);
+                    ap_out[(kk+1)*TILE + ii] = vgetq_lane_f32(v, 1);
+                    ap_out[(kk+2)*TILE + ii] = vgetq_lane_f32(v, 2);
+                    ap_out[(kk+3)*TILE + ii] = vgetq_lane_f32(v, 3);
+                }
+                for (int ii = tile_m; ii < TILE; ii++) {
+                    ap_out[(kk+0)*TILE + ii] = 0;
+                    ap_out[(kk+1)*TILE + ii] = 0;
+                    ap_out[(kk+2)*TILE + ii] = 0;
+                    ap_out[(kk+3)*TILE + ii] = 0;
+                }
+            }
+            for (; kk < k; kk++) {
                 for (int ii = 0; ii < tile_m; ii++)
-                    ap_out[kk * TILE + ii] = a[(i_blk + ii) * lda + kk];
+                    ap_out[kk*TILE + ii] = a_rows[ii][kk];
                 for (int ii = tile_m; ii < TILE; ii++)
-                    ap_out[kk * TILE + ii] = 0.0f;
+                    ap_out[kk*TILE + ii] = 0;
             }
             prev_it = it;
         }
         
-        const uint8_t* bp = b_pack_buf + jt * k * TILE_BYTES;
-        
+        const uint8_t* bp = b_packed + jt * k * TILE_BYTES;
         amx_f32_tile_kernel_4y(a_pack_buf, bp, z_buf, k, tile_m);
         
         for (int ii = 0; ii < tile_m; ii++) {

@@ -108,16 +108,17 @@ extern "C" {
     /// NEON f32 dot product — much faster than AMX for this operation.
     pub fn neon_f32_dot(a: *const f32, b: *const f32, n: i32) -> f32;
 
-    /// Complete sgemm: pack A, pack B, compute, store — all in one C call.
-    pub fn amx_sgemm_pack_and_compute(
+    /// Pack B tiles into contiguous layout (called once, shared by workers).
+    pub fn amx_pack_b(b: *const f32, ldb: i32, k: i32, n: i32, dst: *mut u8);
+
+    /// Worker kernel: uses pre-packed B, packs its own A tiles with NEON.
+    pub fn amx_sgemm_worker(
         a: *const f32, lda: i32,
-        b: *const f32, ldb: i32,
+        b_packed: *const u8,
         c: *mut f32, ldc: i32,
         m: i32, k: i32, n: i32,
         tile_start: i32, tile_end: i32,
-        a_pack_buf: *mut u8,
-        b_pack_buf: *mut u8,
-        z_buf: *mut u8,
+        a_pack_buf: *mut u8, z_buf: *mut u8,
     );
 
     /// Full tile loop: processes tile range [start..end) in a single C call.
