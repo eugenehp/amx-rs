@@ -444,18 +444,46 @@ impl Matrix<f32> {
         #[cfg(target_arch = "aarch64")]
         {
             if amx_sys::is_amx_available() {
-                // Vector-matrix (m=1) or matrix-vector (n=1): scalar is best.
-                // The auto-vectorised i,k,j loop is faster than AMX tile overhead.
-                if m == 1 || n == 1 {
-                    return self.matmul_scalar(other);
-                }
-
                 let max_dim = m.max(n).max(k);
                 let total_ops = m * k * n;
 
-                // NEON for small dense matrices
+                // Tiny matrices: NEON
                 if max_dim <= 32 && total_ops <= 65536 {
                     return self.matmul_neon(other);
+                }
+
+                // On macOS: route through Accelerate for everything else
+                #[cfg(target_os = "macos")]
+                {
+                    // CblasTrans with cached A for aligned medium sizes
+                    if m % 16 == 0 && n <= 1024 && m >= 32 && n >= 32 {
+                        let (a_col, a_stride) = self.ensure_col_cache();
+                        let mut c_data = Vec::with_capacity(m * n);
+                        unsafe { c_data.set_len(m * n); }
+                        unsafe {
+                            accelerate_sgemm_trans(
+                                a_col, a_stride as i32,
+                                other.as_slice().as_ptr(), n as i32,
+                                c_data.as_mut_ptr(), n as i32,
+                                m as i32, n as i32, k as i32,
+                            );
+                        }
+                        return Matrix::from_data(c_data, m, n);
+                    }
+                    // Everything else: standard Accelerate NoTrans
+                    {
+                        let mut c_data = Vec::with_capacity(m * n);
+                        unsafe { c_data.set_len(m * n); }
+                        unsafe {
+                            accelerate_sgemm_notrans(
+                                self.as_slice().as_ptr(), k as i32,
+                                other.as_slice().as_ptr(), n as i32,
+                                c_data.as_mut_ptr(), n as i32,
+                                m as i32, n as i32, k as i32,
+                            );
+                        }
+                        return Matrix::from_data(c_data, m, n);
+                    }
                 }
 
                 // GEBP with full cache blocking for large matrices;
