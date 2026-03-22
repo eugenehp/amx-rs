@@ -46,9 +46,9 @@ mod inner {
     fn get_pool() -> &'static AmxPool {
         unsafe {
             POOL_INIT.call_once(|| {
-                let n = std::thread::available_parallelism()
+                let n_cpus = std::thread::available_parallelism()
                     .map(|n| n.get()).unwrap_or(1).min(MAX_WORKERS);
-                let n_workers = if n > 1 { n - 1 } else { 0 };
+                let n_workers = if n_cpus > 1 { n_cpus - 1 } else { 0 };
 
                 let a_sz = MAX_K_BUF * TILE_BYTES;
                 let b_sz = MAX_N_TILES * MAX_K_BUF * TILE_BYTES;
@@ -154,23 +154,37 @@ mod inner {
             return;
         }
 
-        let tiles_per = (total_tiles + nw - 1) / nw;
+        // Use all available workers — B packing redundancy is offset by
+        // L1 cache benefits (each worker's B is hot in its own L1).
+        let active = nw;
+
+        let tiles_per = (total_tiles + active - 1) / active;
         for i in 0..nw {
-            let start = i * tiles_per;
-            let end = ((i + 1) * tiles_per).min(total_tiles);
             let slot = &pool.slots[i];
             let job = &mut *slot.job.get();
-            *job = SgemmJob {
-                a: a as usize, lda,
-                b: b as usize, ldb,
-                c: c as usize, ldc,
-                m, k, n,
-                tile_start: start, tile_end: end,
-            };
+            if i < active {
+                let start = i * tiles_per;
+                let end = ((i + 1) * tiles_per).min(total_tiles);
+                *job = SgemmJob {
+                    a: a as usize, lda,
+                    b: b as usize, ldb,
+                    c: c as usize, ldc,
+                    m, k, n,
+                    tile_start: start, tile_end: end,
+                };
+            } else {
+                // Give empty range to unused workers
+                *job = SgemmJob {
+                    a: 0, lda: 0, b: 0, ldb: 0, c: 0, ldc: 0,
+                    m: 0, k: 0, n: 0,
+                    tile_start: 0, tile_end: 0,
+                };
+            }
         }
 
         let gen = pool.generation.fetch_add(1, Ordering::Release) + 1;
 
+        // Wait only for active workers
         for i in 0..nw {
             let slot = &pool.slots[i];
             loop {
