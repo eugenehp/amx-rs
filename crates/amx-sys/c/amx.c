@@ -145,7 +145,10 @@ void amx_f32_load_z(const void* src, int rows) {
 
 // Complete f32 micro-kernel: zero Z, accumulate k rank-1 updates,
 // store tile_m rows to dst.  Single FFI call per 16×16 tile.
-// Software-pipelined: loads overlap with compute for better throughput.
+//
+// Uses double-buffered loads: alternates between X[0]/Y[0] and X[1]/Y[1]
+// so that loads for iteration k+1 overlap with the FMA of iteration k.
+// Also prefetches data 4 iterations ahead.
 void amx_f32_tile_kernel(const void* a_panel, const void* b_panel,
                          void* dst, int k, int tile_m) {
     // Zero Z
@@ -155,52 +158,108 @@ void amx_f32_tile_kernel(const void* a_panel, const void* b_panel,
         AMX_OP_GPR(4, zbase | ((uint64_t)(i * 4) << 56));
     }
 
-    // Software-pipelined accumulate
     const uint8_t* ap = (const uint8_t*)a_panel;
     const uint8_t* bp = (const uint8_t*)b_panel;
 
-    if (k > 0) {
-        // Preload first pair
-        AMX_OP_GPR(1, (uint64_t)(ap));
-        AMX_OP_GPR(0, (uint64_t)(bp));
+    if (k <= 0) goto store;
 
-        int kk = 1;
-        // Unrolled 4× with pipelining
-        for (; kk + 3 < k; kk += 4) {
-            AMX_OP_GPR(12, 0);
-            AMX_OP_GPR(1, (uint64_t)(ap + kk * 64));
-            AMX_OP_GPR(0, (uint64_t)(bp + kk * 64));
+    // AMX register pair encoding for fma32:
+    //   X offset in bits [29:20], Y offset in bits [19:10]
+    //   X row 0 = offset 0, X row 1 = offset 64
+    //   Y row 0 = offset 0, Y row 1 = offset 64
+    #define FMA32_XY(xrow, yrow) (((uint64_t)(xrow) * 64 << 20) | ((uint64_t)(yrow) * 64 << 10))
+    #define LDX_ROW(ptr, row) ((uint64_t)(ptr) | ((uint64_t)(row) << 56))
+    #define LDY_ROW(ptr, row) ((uint64_t)(ptr) | ((uint64_t)(row) << 56))
 
-            AMX_OP_GPR(12, 0);
-            AMX_OP_GPR(1, (uint64_t)(ap + (kk+1) * 64));
-            AMX_OP_GPR(0, (uint64_t)(bp + (kk+1) * 64));
-
-            AMX_OP_GPR(12, 0);
-            AMX_OP_GPR(1, (uint64_t)(ap + (kk+2) * 64));
-            AMX_OP_GPR(0, (uint64_t)(bp + (kk+2) * 64));
-
-            AMX_OP_GPR(12, 0);
-            AMX_OP_GPR(1, (uint64_t)(ap + (kk+3) * 64));
-            AMX_OP_GPR(0, (uint64_t)(bp + (kk+3) * 64));
-        }
-        for (; kk < k; kk++) {
-            AMX_OP_GPR(12, 0);
-            AMX_OP_GPR(1, (uint64_t)(ap + kk * 64));
-            AMX_OP_GPR(0, (uint64_t)(bp + kk * 64));
-        }
-        AMX_OP_GPR(12, 0); // final fma
+    if (k == 1) {
+        AMX_OP_GPR(1, (uint64_t)ap);       // ldy Y[0]
+        AMX_OP_GPR(0, (uint64_t)bp);       // ldx X[0]
+        AMX_OP_GPR(12, 0);                 // fma32 X[0]*Y[0]
+        goto store;
     }
 
-    // Store
-    uint8_t* p = (uint8_t*)dst;
-    for (int i = 0; i < tile_m; i++) {
-        AMX_OP_GPR(5, ((uint64_t)(p + i * 64)) | ((uint64_t)(i * 4) << 56));
+    // Double-buffered pipeline:
+    // Load pair 0 into X[0]/Y[0], pair 1 into X[1]/Y[1]
+    // Then: fma X[0]*Y[0], load next into X[0]/Y[0], fma X[1]*Y[1], load next into X[1]/Y[1], ...
+
+    // Preload first two pairs
+    AMX_OP_GPR(1, LDY_ROW(ap, 0));             // ldy Y[0] <- a[0]
+    AMX_OP_GPR(0, LDX_ROW(bp, 0));             // ldx X[0] <- b[0]
+    AMX_OP_GPR(1, LDY_ROW(ap + 64, 1));        // ldy Y[1] <- a[1]
+    AMX_OP_GPR(0, LDX_ROW(bp + 64, 1));        // ldx X[1] <- b[1]
+
+    int kk = 2;
+
+    // Main loop: process pairs, alternating X[0]/Y[0] and X[1]/Y[1]
+    // 4× unrolled: each iteration processes 4 k-steps
+    for (; kk + 3 < k; kk += 4) {
+        // Prefetch 4 iterations ahead
+        __builtin_prefetch(ap + (kk + 4) * 64, 0, 3);
+        __builtin_prefetch(bp + (kk + 4) * 64, 0, 3);
+
+        // FMA pair 0, reload pair 0
+        AMX_OP_GPR(12, FMA32_XY(0, 0));         // fma32 X[0]*Y[0]
+        AMX_OP_GPR(1, LDY_ROW(ap + kk * 64, 0));
+        AMX_OP_GPR(0, LDX_ROW(bp + kk * 64, 0));
+
+        // FMA pair 1, reload pair 1
+        AMX_OP_GPR(12, FMA32_XY(1, 1));         // fma32 X[1]*Y[1]
+        AMX_OP_GPR(1, LDY_ROW(ap + (kk+1) * 64, 1));
+        AMX_OP_GPR(0, LDX_ROW(bp + (kk+1) * 64, 1));
+
+        // FMA pair 0, reload pair 0
+        AMX_OP_GPR(12, FMA32_XY(0, 0));
+        AMX_OP_GPR(1, LDY_ROW(ap + (kk+2) * 64, 0));
+        AMX_OP_GPR(0, LDX_ROW(bp + (kk+2) * 64, 0));
+
+        // FMA pair 1, reload pair 1
+        AMX_OP_GPR(12, FMA32_XY(1, 1));
+        AMX_OP_GPR(1, LDY_ROW(ap + (kk+3) * 64, 1));
+        AMX_OP_GPR(0, LDX_ROW(bp + (kk+3) * 64, 1));
+    }
+
+    // Handle remaining k-steps with double buffering
+    for (; kk + 1 < k; kk += 2) {
+        AMX_OP_GPR(12, FMA32_XY(0, 0));
+        AMX_OP_GPR(1, LDY_ROW(ap + kk * 64, 0));
+        AMX_OP_GPR(0, LDX_ROW(bp + kk * 64, 0));
+
+        AMX_OP_GPR(12, FMA32_XY(1, 1));
+        AMX_OP_GPR(1, LDY_ROW(ap + (kk+1) * 64, 1));
+        AMX_OP_GPR(0, LDX_ROW(bp + (kk+1) * 64, 1));
+    }
+
+    // Drain: FMA the last loaded pair(s)
+    if (kk == k) {
+        // Last loaded was pair 1 (kk was even entering, loaded 0 and 1)
+        AMX_OP_GPR(12, FMA32_XY(0, 0));
+        AMX_OP_GPR(12, FMA32_XY(1, 1));
+    } else {
+        // kk == k-1: we have pair 0 loaded but need one more
+        AMX_OP_GPR(12, FMA32_XY(0, 0));
+        AMX_OP_GPR(12, FMA32_XY(1, 1));
+        // Load and process the last one
+        AMX_OP_GPR(1, LDY_ROW(ap + kk * 64, 0));
+        AMX_OP_GPR(0, LDX_ROW(bp + kk * 64, 0));
+        AMX_OP_GPR(12, FMA32_XY(0, 0));
+    }
+
+    #undef FMA32_XY
+    #undef LDX_ROW
+    #undef LDY_ROW
+
+store:
+    {
+        uint8_t* p = (uint8_t*)dst;
+        for (int i = 0; i < tile_m; i++) {
+            AMX_OP_GPR(5, ((uint64_t)(p + i * 64)) | ((uint64_t)(i * 4) << 56));
+        }
     }
 }
 
 // Accumulating tile kernel: loads existing partial sums from dst into Z,
 // then accumulates k rank-1 updates and stores back.
-// Used for KC-blocked matmul where the k-dimension is split into blocks.
+// Uses double-buffered loads like amx_f32_tile_kernel.
 void amx_f32_tile_kernel_accum(const void* a_panel, const void* b_panel,
                                void* dst, int k, int tile_m) {
     // Load existing partial sums into Z
@@ -215,45 +274,152 @@ void amx_f32_tile_kernel_accum(const void* a_panel, const void* b_panel,
         AMX_OP_GPR(4, zbase | ((uint64_t)(i * 4) << 56));
     }
 
-    // Software-pipelined accumulate
     const uint8_t* ap = (const uint8_t*)a_panel;
     const uint8_t* bp = (const uint8_t*)b_panel;
 
-    if (k > 0) {
-        AMX_OP_GPR(1, (uint64_t)(ap));
-        AMX_OP_GPR(0, (uint64_t)(bp));
+    if (k <= 0) goto store_accum;
 
-        int kk = 1;
+    #define FMA32_XY(xrow, yrow) (((uint64_t)(xrow) * 64 << 20) | ((uint64_t)(yrow) * 64 << 10))
+    #define LDX_ROW(ptr, row) ((uint64_t)(ptr) | ((uint64_t)(row) << 56))
+    #define LDY_ROW(ptr, row) ((uint64_t)(ptr) | ((uint64_t)(row) << 56))
+
+    if (k == 1) {
+        AMX_OP_GPR(1, (uint64_t)ap);
+        AMX_OP_GPR(0, (uint64_t)bp);
+        AMX_OP_GPR(12, 0);
+        goto store_accum;
+    }
+
+    // Double-buffered: preload first two pairs
+    AMX_OP_GPR(1, LDY_ROW(ap, 0));
+    AMX_OP_GPR(0, LDX_ROW(bp, 0));
+    AMX_OP_GPR(1, LDY_ROW(ap + 64, 1));
+    AMX_OP_GPR(0, LDX_ROW(bp + 64, 1));
+
+    {
+        int kk = 2;
         for (; kk + 3 < k; kk += 4) {
-            AMX_OP_GPR(12, 0);
-            AMX_OP_GPR(1, (uint64_t)(ap + kk * 64));
-            AMX_OP_GPR(0, (uint64_t)(bp + kk * 64));
+            __builtin_prefetch(ap + (kk + 4) * 64, 0, 3);
+            __builtin_prefetch(bp + (kk + 4) * 64, 0, 3);
 
-            AMX_OP_GPR(12, 0);
-            AMX_OP_GPR(1, (uint64_t)(ap + (kk+1) * 64));
-            AMX_OP_GPR(0, (uint64_t)(bp + (kk+1) * 64));
+            AMX_OP_GPR(12, FMA32_XY(0, 0));
+            AMX_OP_GPR(1, LDY_ROW(ap + kk * 64, 0));
+            AMX_OP_GPR(0, LDX_ROW(bp + kk * 64, 0));
 
-            AMX_OP_GPR(12, 0);
-            AMX_OP_GPR(1, (uint64_t)(ap + (kk+2) * 64));
-            AMX_OP_GPR(0, (uint64_t)(bp + (kk+2) * 64));
+            AMX_OP_GPR(12, FMA32_XY(1, 1));
+            AMX_OP_GPR(1, LDY_ROW(ap + (kk+1) * 64, 1));
+            AMX_OP_GPR(0, LDX_ROW(bp + (kk+1) * 64, 1));
 
-            AMX_OP_GPR(12, 0);
-            AMX_OP_GPR(1, (uint64_t)(ap + (kk+3) * 64));
-            AMX_OP_GPR(0, (uint64_t)(bp + (kk+3) * 64));
+            AMX_OP_GPR(12, FMA32_XY(0, 0));
+            AMX_OP_GPR(1, LDY_ROW(ap + (kk+2) * 64, 0));
+            AMX_OP_GPR(0, LDX_ROW(bp + (kk+2) * 64, 0));
+
+            AMX_OP_GPR(12, FMA32_XY(1, 1));
+            AMX_OP_GPR(1, LDY_ROW(ap + (kk+3) * 64, 1));
+            AMX_OP_GPR(0, LDX_ROW(bp + (kk+3) * 64, 1));
         }
-        for (; kk < k; kk++) {
+
+        for (; kk + 1 < k; kk += 2) {
+            AMX_OP_GPR(12, FMA32_XY(0, 0));
+            AMX_OP_GPR(1, LDY_ROW(ap + kk * 64, 0));
+            AMX_OP_GPR(0, LDX_ROW(bp + kk * 64, 0));
+
+            AMX_OP_GPR(12, FMA32_XY(1, 1));
+            AMX_OP_GPR(1, LDY_ROW(ap + (kk+1) * 64, 1));
+            AMX_OP_GPR(0, LDX_ROW(bp + (kk+1) * 64, 1));
+        }
+
+        if (kk == k) {
+            AMX_OP_GPR(12, FMA32_XY(0, 0));
+            AMX_OP_GPR(12, FMA32_XY(1, 1));
+        } else {
+            AMX_OP_GPR(12, FMA32_XY(0, 0));
+            AMX_OP_GPR(12, FMA32_XY(1, 1));
+            AMX_OP_GPR(1, LDY_ROW(ap + kk * 64, 0));
+            AMX_OP_GPR(0, LDX_ROW(bp + kk * 64, 0));
+            AMX_OP_GPR(12, FMA32_XY(0, 0));
+        }
+    }
+
+    #undef FMA32_XY
+    #undef LDX_ROW
+    #undef LDY_ROW
+
+store_accum:
+    {
+        uint8_t* p = (uint8_t*)dst;
+        for (int i = 0; i < tile_m; i++) {
+            AMX_OP_GPR(5, ((uint64_t)(p + i * 64)) | ((uint64_t)(i * 4) << 56));
+        }
+    }
+}
+
+// ── 2×1 tile kernel: processes two i-tiles sharing the same B panel ──
+//
+// This amortizes B loads: one ldx serves two fma32 instructions (one per
+// i-tile).  Each i-tile uses different Y registers for its A data, and
+// accumulates to different Z row ranges.
+//
+// Z layout for f32 outer product:
+//   fma32 with operand bits [9:0] selecting z_row offset:
+//   - z_row=0: accumulates to Z rows 0,4,8,...,60  (i-tile 0)
+//   - We need a second set for i-tile 1
+//
+// Unfortunately, AMX only has one set of Z rows for f32 outer products
+// (16 logical rows × 16 columns = 256 values = 1024 bytes).
+// So we process 2 i-tiles sequentially but share the packed B panel,
+// saving B reload time from cache (B stays hot in L1).
+//
+// Instead, implement a multi-j-tile approach: process 2 j-tiles per
+// i-tile, keeping B panel hot in registers.
+void amx_f32_tile_kernel_2j(const void* a_panel, 
+                             const void* b_panel0, const void* b_panel1,
+                             void* dst0, void* dst1,
+                             int k, int tile_m, int tile_n0, int tile_n1) {
+    static const uint8_t zeros[64] __attribute__((aligned(128))) = {0};
+    uint64_t zbase = (uint64_t)zeros;
+    
+    const uint8_t* ap = (const uint8_t*)a_panel;
+    const uint8_t* bp0 = (const uint8_t*)b_panel0;
+    const uint8_t* bp1 = (const uint8_t*)b_panel1;
+    
+    // Process j-tile 0
+    for (int i = 0; i < 16; i++)
+        AMX_OP_GPR(4, zbase | ((uint64_t)(i * 4) << 56));
+    
+    if (k > 0) {
+        AMX_OP_GPR(1, (uint64_t)ap);
+        AMX_OP_GPR(0, (uint64_t)bp0);
+        for (int kk = 1; kk < k; kk++) {
             AMX_OP_GPR(12, 0);
             AMX_OP_GPR(1, (uint64_t)(ap + kk * 64));
-            AMX_OP_GPR(0, (uint64_t)(bp + kk * 64));
+            AMX_OP_GPR(0, (uint64_t)(bp0 + kk * 64));
         }
         AMX_OP_GPR(12, 0);
     }
-
-    // Store back
-    uint8_t* p = (uint8_t*)dst;
-    for (int i = 0; i < tile_m; i++) {
-        AMX_OP_GPR(5, ((uint64_t)(p + i * 64)) | ((uint64_t)(i * 4) << 56));
+    
+    uint8_t* p0 = (uint8_t*)dst0;
+    for (int i = 0; i < tile_m; i++)
+        AMX_OP_GPR(5, ((uint64_t)(p0 + i * 64)) | ((uint64_t)(i * 4) << 56));
+    
+    // Process j-tile 1 — A panel is still hot in L1 cache
+    for (int i = 0; i < 16; i++)
+        AMX_OP_GPR(4, zbase | ((uint64_t)(i * 4) << 56));
+    
+    if (k > 0) {
+        AMX_OP_GPR(1, (uint64_t)ap);
+        AMX_OP_GPR(0, (uint64_t)bp1);
+        for (int kk = 1; kk < k; kk++) {
+            AMX_OP_GPR(12, 0);
+            AMX_OP_GPR(1, (uint64_t)(ap + kk * 64));
+            AMX_OP_GPR(0, (uint64_t)(bp1 + kk * 64));
+        }
+        AMX_OP_GPR(12, 0);
     }
+    
+    uint8_t* p1 = (uint8_t*)dst1;
+    for (int i = 0; i < tile_m; i++)
+        AMX_OP_GPR(5, ((uint64_t)(p1 + i * 64)) | ((uint64_t)(i * 4) << 56));
 }
 
 // ── NEON kernels ─────────────────────────────────────────────────────
