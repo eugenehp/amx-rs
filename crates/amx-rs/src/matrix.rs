@@ -24,6 +24,27 @@ pub struct Matrix<T> {
 
 // Safety: col_ptr is lazily initialized and then immutable.
 // Only written once under the check `col_ptr.is_null()`.
+/// Call Accelerate's cblas_sgemm standard (NoTrans) path.
+#[cfg(target_os = "macos")]
+unsafe fn accelerate_sgemm_notrans(
+    a: *const f32, lda: i32,
+    b: *const f32, ldb: i32,
+    c: *mut f32, ldc: i32,
+    m: i32, n: i32, k: i32,
+) {
+    #[link(name = "Accelerate", kind = "framework")]
+    extern "C" {
+        fn cblas_sgemm(
+            order: i32, transa: i32, transb: i32,
+            m: i32, n: i32, k: i32,
+            alpha: f32, a: *const f32, lda: i32,
+            b: *const f32, ldb: i32,
+            beta: f32, c: *mut f32, ldc: i32,
+        );
+    }
+    cblas_sgemm(101, 111, 111, m, n, k, 1.0, a, lda, b, ldb, 0.0, c, ldc);
+}
+
 /// Call Accelerate's cblas_sgemm with CblasTrans on pre-transposed A.
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
@@ -470,6 +491,23 @@ impl Matrix<f32> {
                             }
                             return Matrix::from_data(c_data, m, n);
                         }
+                        // Large matrices: use Accelerate NoTrans
+                        // (better cache blocking than our pool)
+                        #[cfg(target_os = "macos")]
+                        {
+                            let mut c_data = Vec::with_capacity(m * n);
+                            unsafe {
+                                c_data.set_len(m * n);
+                                accelerate_sgemm_notrans(
+                                    self.as_slice().as_ptr(), k as i32,
+                                    other.as_slice().as_ptr(), n as i32,
+                                    c_data.as_mut_ptr(), n as i32,
+                                    m as i32, n as i32, k as i32,
+                                );
+                            }
+                            return Matrix::from_data(c_data, m, n);
+                        }
+                        #[cfg(not(target_os = "macos"))]
                         return self.matmul_pool(other);
                     } else {
                         return self.matmul_amx(other);
