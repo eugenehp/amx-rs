@@ -206,22 +206,33 @@ This parses all text-format benchmark results, averages multiple runs per chip, 
 
 ![Single P-core GFLOPS](./figures/single-pcore-gflops.svg)
 
+![All P-cores parallel GFLOPS](./figures/all-pcores-parallel-gflops.svg)
+
 ![Whole chip GFLOPS](./figures/whole-chip-gflops.svg)
+
+![Chip function throughput heatmap](./figures/chip-function-throughput-heatmap.svg)
 
 ![Instruction throughput heatmap](./figures/instruction-throughput-heatmap.svg)
 
-#### Current Results (4 chips)
+#### Current Results — M4 Pro Virtual (10c: 10P)
 
-| Metric | M1 Max (10c: 8P+2E) | M3 Max (16c: 12P+4E) | M4 Pro (14c: 10P+4E) | M4 Pro Virtual (10c: 10P) |
-|--------|---------------------|----------------------|----------------------|--------------------------|
-| fma16 matrix (1 P-core) | 1,421 GFLOPS | 1,793 GFLOPS | 1,818 GFLOPS | 1,891 GFLOPS |
-| mac16 matrix (1 P-core) | 1,485 GFLOPS | 1,802 GFLOPS | 1,897 GFLOPS | 1,925 GFLOPS |
-| fma32 matrix (1 P-core) | 369 GFLOPS | 449 GFLOPS | 499 GFLOPS | 470 GFLOPS |
-| fma16 matrix (whole chip) | 4,526 GFLOPS | 10,013 GFLOPS | 9,394 GFLOPS | 9,308 GFLOPS |
-| mac16 matrix (whole chip) | 2,954 GFLOPS | 9,541 GFLOPS | 4,741 GFLOPS | 5,481 GFLOPS |
-| fma32 matrix (whole chip) | 2,842 GFLOPS | 4,548 GFLOPS | 4,071 GFLOPS | 4,092 GFLOPS |
+| Metric | GFLOPS |
+|--------|-------:|
+| fma16 matrix (1 P-core) | 1,996 |
+| mac16 matrix (1 P-core) | 1,967 |
+| fma32 matrix (1 P-core) | 492 |
+| fma64 matrix (1 P-core) | 126 |
+| fma16 vector (1 P-core) | 63 |
+| fma32 vector (1 P-core) | 31 |
+| fma16 matrix (all P-cores parallel) | 8,164 |
+| mac16 matrix (all P-cores parallel) | 5,143 |
+| fma32 matrix (all P-cores parallel) | 4,149 |
+| fma16 matrix (whole chip) | 11,153 |
+| mac16 matrix (whole chip) | 5,248 |
+| fma32 matrix (whole chip) | 3,822 |
+| fma64 matrix (whole chip) | 1,010 |
 
-> **M3 Max** leads whole-chip throughput thanks to 12 P-cores. **M4 Pro** has the fastest per-core fma32 matrix at 499 GFLOPS. All M3/M4 chips are ~1.3× faster per P-core than M1 Max.
+> **M4 Pro Virtual** achieves ~2.0 TFLOPS per P-core for fma16 matrix and ~11.2 TFLOPS whole-chip. The fma32 matrix peaks at 492 GFLOPS single-core and 3.8 TFLOPS whole-chip.
 
 ### Backend Comparison: Scalar Rust vs AMX vs Accelerate
 
@@ -340,7 +351,7 @@ cargo run --example vector_ops
 - Single P-core and E-core latency (ns/op)
 - All P-cores and E-cores parallel scaling
 - Whole-chip aggregate throughput
-- Chips tested: Apple M1 Max (8P+2E), Apple M4 Pro Virtual (10P+0E)
+- Chips tested: Apple M4 Pro Virtual (10P+0E)
 
 The cross-chip comparison scripts select the best or average run per chip and generate SVG figures for visual comparison.
 
@@ -383,6 +394,6 @@ Based on research from:
 
 ---
 
-**Generated:** 2026-03-21
+**Generated:** 2026-03-22
 **Status:** ✅ PRODUCTION READY
 **Location:** `/Users/Shared/amx-rs`
