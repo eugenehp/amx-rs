@@ -214,10 +214,74 @@ mod inner {
             }
         }
     }
+
+    pub(crate) unsafe fn pool_sgemm_with_flag(
+        a: *const f32, lda: usize,
+        b: *const f32, ldb: usize,
+        c: *mut f32, ldc: usize,
+        m: usize, k: usize, n: usize,
+        direct_b_flag: i32,
+    ) {
+        let n_i_tiles = (m + TILE - 1) / TILE;
+        let pool = get_pool();
+        let nw = pool.n_workers;
+        if nw == 0 || n_i_tiles < 2 {
+            let z_sz = ((n+15)/16)*16*TILE_BYTES;
+            let a_buf = crate::matrix::aligned_alloc(MAX_K_BUF*TILE_BYTES,128);
+            let z_buf = crate::matrix::aligned_alloc(z_sz,128);
+            amx_sys::amx_set();
+            amx_sys::amx_sgemm_worker(
+                a,lda as i32,b as *const f32,ldb as i32,
+                c,ldc as i32,m as i32,k as i32,n as i32,
+                0,n_i_tiles as i32,a_buf,z_buf,direct_b_flag,
+            );
+            amx_sys::amx_clr();
+            crate::matrix::aligned_free(a_buf,MAX_K_BUF*TILE_BYTES,128);
+            crate::matrix::aligned_free(z_buf,z_sz,128);
+            return;
+        }
+        let active = nw.min(n_i_tiles);
+        let rows_per = (n_i_tiles+active-1)/active;
+        for i in 0..active {
+            let slot = &pool.slots[i];
+            let job = &mut *slot.job.get();
+            let start = i*rows_per;
+            let end = ((i+1)*rows_per).min(n_i_tiles);
+            *job = SgemmJob {
+                a: a as usize, lda,
+                b_packed: b as usize,
+                c: c as usize, ldc,
+                m, k, n,
+                tile_start: start, tile_end: end,
+                b_ready_flag: 0,
+                b_ready_gen: direct_b_flag as u32,
+            };
+        }
+        for i in active..nw {
+            let slot = &pool.slots[i];
+            (*slot.job.get()).tile_start = 0;
+            (*slot.job.get()).tile_end = 0;
+        }
+        for i in 0..active {
+            pool.slots[i].work_gen.fetch_add(1, Ordering::Release);
+        }
+        for i in 0..active {
+            let slot = &pool.slots[i];
+            let target = slot.work_gen.load(Ordering::Relaxed);
+            loop {
+                if slot.done_gen.load(Ordering::Acquire) >= target { break; }
+                core::hint::spin_loop();
+            }
+        }
+    }
 }
 
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 pub(crate) use inner::pool_sgemm;
+
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+pub(crate) use inner::pool_sgemm_with_flag;
+
 
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 pub(crate) unsafe fn pool_dispatch_tiles(
