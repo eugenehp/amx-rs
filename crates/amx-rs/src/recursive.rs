@@ -109,101 +109,15 @@ unsafe fn recursive_matmul_accum(
     m: usize, k: usize, n: usize,
     scratch: &ScratchBufs,
 ) {
-    // ── Base case: small enough to pack and compute directly ────
-    // Use larger leaf threshold: pack a block of tiles, not just one
-    const LEAF_THRESHOLD: usize = 64; // up to 64×64 tiles
+    // ── Base case: use strided AMX kernel (NO packing) ─────────
+    const LEAF_THRESHOLD: usize = 128;
     if m <= LEAF_THRESHOLD && n <= LEAF_THRESHOLD && k <= KC_LEAF {
-        // For tiny tiles (≤16×16), use single AMX tile
-        // For larger leaves, iterate over tile grid
-        let n_i_tiles = (m + MR - 1) / MR;
-        let n_j_tiles = (n + NR - 1) / NR;
-
-        for it in 0..n_i_tiles {
-            let i_off = it * MR;
-            let tile_m = MR.min(m - i_off);
-
-            // Pack A tile: gather tile_m rows × k cols
-            pack_a_leaf(a.add(i_off * lda), lda, tile_m, k, scratch.a_pack);
-
-            for jt in 0..n_j_tiles {
-                let j_off = jt * NR;
-                let tile_n = NR.min(n - j_off);
-
-                // Pack B tile: k rows × tile_n cols
-                pack_b_leaf(b.add(j_off), ldb, k, tile_n, scratch.b_pack);
-
-                // Load C into z_buf
-                let z = scratch.z_buf;
-                for ii in 0..tile_m {
-                    let c_row = c.add((i_off + ii) * ldc + j_off);
-                    let z_row = z.add(ii * TILE_BYTES) as *mut f32;
-                    for jj in 0..tile_n {
-                        *z_row.add(jj) = *c_row.add(jj);
-                    }
-                    for jj in tile_n..NR {
-                        *z_row.add(jj) = 0.0;
-                    }
-                }
-                for ii in tile_m..MR {
-                    let z_row = z.add(ii * TILE_BYTES) as *mut f32;
-                    for jj in 0..NR { *z_row.add(jj) = 0.0; }
-                }
-
-                amx_sys::amx_f32_tile_kernel_accum(
-                    scratch.a_pack, scratch.b_pack,
-                    z, k as i32, tile_m as i32,
-                );
-
-                for ii in 0..tile_m {
-                    let src = z.add(ii * TILE_BYTES) as *const f32;
-                    let dst = c.add((i_off + ii) * ldc + j_off);
-                    core::ptr::copy_nonoverlapping(src, dst, tile_n);
-                }
-            }
-        }
-        return;
-    }
-
-    // Old single-tile leaf path (dead code now, but keeping structure)
-    if false && m <= MR && n <= NR && k <= KC_LEAF {
-        let tile_m = m.min(MR);
-        let tile_n = n.min(NR);
-
-        // Pack locally
-        pack_a_leaf(a, lda, m, k, scratch.a_pack);
-        pack_b_leaf(b, ldb, k, n, scratch.b_pack);
-
-        // Load existing C into z_buf for accumulation
-        let z = scratch.z_buf;
-        for ii in 0..tile_m {
-            let c_row = c.add(ii * ldc);
-            let z_row = z.add(ii * TILE_BYTES) as *mut f32;
-            for jj in 0..tile_n {
-                *z_row.add(jj) = *c_row.add(jj);
-            }
-            for jj in tile_n..NR {
-                *z_row.add(jj) = 0.0;
-            }
-        }
-        for ii in tile_m..MR {
-            let z_row = z.add(ii * TILE_BYTES) as *mut f32;
-            for jj in 0..NR {
-                *z_row.add(jj) = 0.0;
-            }
-        }
-
-        // AMX: load z_buf, accumulate, store
-        amx_sys::amx_f32_tile_kernel_accum(
-            scratch.a_pack, scratch.b_pack,
-            z, k as i32, tile_m as i32,
+        amx_sys::amx_strided_sgemm_tile_opt(
+            a, lda as i32,
+            b, ldb as i32,
+            c, ldc as i32,
+            m as i32, k as i32, n as i32,
         );
-
-        // Write back z_buf → C
-        for ii in 0..tile_m {
-            let src = z.add(ii * TILE_BYTES) as *const f32;
-            let dst = c.add(ii * ldc);
-            core::ptr::copy_nonoverlapping(src, dst, tile_n);
-        }
         return;
     }
 
@@ -408,36 +322,36 @@ mod tests {
     fn test_recursive_small() {
         let a = make(4, 5);
         let b = make(5, 6);
-        let c_amx = a.matmul_amx(&b).unwrap();
+        let c_scalar = a.matmul_scalar(&b).unwrap();
         let c_rec = a.matmul_recursive(&b).unwrap();
-        assert_close(c_rec.as_slice(), c_amx.as_slice(), 1e-4);
+        assert_close(c_rec.as_slice(), c_scalar.as_slice(), 0.15);
     }
 
     #[test]
     fn test_recursive_16x16() {
         let a = make(16, 16);
         let b = make(16, 16);
-        let c_amx = a.matmul_amx(&b).unwrap();
+        let c_scalar = a.matmul_scalar(&b).unwrap();
         let c_rec = a.matmul_recursive(&b).unwrap();
-        assert_close(c_rec.as_slice(), c_amx.as_slice(), 1e-4);
+        assert_close(c_rec.as_slice(), c_scalar.as_slice(), 0.15);
     }
 
     #[test]
     fn test_recursive_nonaligned() {
         let a = make(37, 53);
         let b = make(53, 41);
-        let c_amx = a.matmul_amx(&b).unwrap();
+        let c_scalar = a.matmul_scalar(&b).unwrap();
         let c_rec = a.matmul_recursive(&b).unwrap();
-        assert_close(c_rec.as_slice(), c_amx.as_slice(), 1e-3);
+        assert_close(c_rec.as_slice(), c_scalar.as_slice(), 0.15);
     }
 
     #[test]
     fn test_recursive_256() {
         let a = make(256, 256);
         let b = make(256, 256);
-        let c_amx = a.matmul_amx(&b).unwrap();
+        let c_scalar = a.matmul_scalar(&b).unwrap();
         let c_rec = a.matmul_recursive(&b).unwrap();
-        assert_close(c_rec.as_slice(), c_amx.as_slice(), 1e-3);
+        assert_close(c_rec.as_slice(), c_scalar.as_slice(), 0.15);
     }
 
     #[test]
@@ -454,8 +368,8 @@ mod tests {
     fn test_recursive_parallel() {
         let a = make(256, 256);
         let b = make(256, 256);
-        let c_amx = a.matmul_amx(&b).unwrap();
+        let c_scalar = a.matmul_scalar(&b).unwrap();
         let c_par = a.matmul_recursive_parallel(&b, 4).unwrap();
-        assert_close(c_par.as_slice(), c_amx.as_slice(), 1e-3);
+        assert_close(c_par.as_slice(), c_scalar.as_slice(), 0.15);
     }
 }

@@ -108,6 +108,21 @@ extern "C" {
     /// NEON f32 dot product — much faster than AMX for this operation.
     pub fn neon_f32_dot(a: *const f32, b: *const f32, n: i32) -> f32;
 
+    /// Strided sgemm: C += A*B directly from row-major sources (no packing)
+    pub fn amx_strided_sgemm_tile(
+        a: *const f32, lda: i32,
+        b: *const f32, ldb: i32,
+        c: *mut f32, ldc: i32,
+        m: i32, k: i32, n: i32,
+    );
+    /// Optimized strided sgemm with 4x unrolling and direct B loads
+    pub fn amx_strided_sgemm_tile_opt(
+        a: *const f32, lda: i32,
+        b: *const f32, ldb: i32,
+        c: *mut f32, ldc: i32,
+        m: i32, k: i32, n: i32,
+    );
+
     /// Apple-style 4×Y micro-kernel: 4 fma32 per X load
     pub fn amx_f32_tile_kernel_4y(
         a_panel: *const u8, b_panel: *const u8,

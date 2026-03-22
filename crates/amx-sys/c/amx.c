@@ -544,6 +544,165 @@ void amx_f32_tile_kernel_4y_accum(const void* a_panel, const void* b_panel,
     }
 }
 
+// ── Strided AMX kernel (no pre-packing) ──────────────────────────────
+//
+// Computes C[m×n] += A[m×k] × B[k×n] directly from row-major strided
+// source matrices. NO separate packing pass — column-gathers A into
+// a 64-byte stack buffer inline before each ldy.
+//
+// This is the key to matching Apple's Accelerate at small sizes:
+// zero packing overhead, just gather → ldy → ldx → fma32 → store.
+//
+// a: pointer to A[0,0], stride lda (A[i,j] = a[i*lda+j])  
+// b: pointer to B[0,0], stride ldb
+// c: pointer to C[0,0], stride ldc
+// C is ACCUMULATED (caller must zero C first if needed).
+void amx_strided_sgemm_tile(
+    const float* a, int lda,
+    const float* b, int ldb, 
+    float* c, int ldc,
+    int m, int k, int n)
+{
+    // Process in 16×16 output tiles
+    const int MR = 16, NR = 16;
+    
+    for (int i0 = 0; i0 < m; i0 += MR) {
+        int tm = MR < (m - i0) ? MR : (m - i0);
+        
+        for (int j0 = 0; j0 < n; j0 += NR) {
+            int tn = NR < (n - j0) ? NR : (n - j0);
+            
+            // Zero Z
+            {
+                static const uint8_t zeros[64] __attribute__((aligned(128))) = {0};
+                uint64_t zb = (uint64_t)zeros;
+                for (int i = 0; i < 16; i++)
+                    AMX_OP_GPR(4, zb | ((uint64_t)(i * 4) << 56));
+            }
+            
+            // Accumulate over k
+            for (int kk = 0; kk < k; kk++) {
+                // Gather A column: A[i0+0..tm-1, kk] → y_buf
+                float __attribute__((aligned(64))) y_buf[16] = {0};
+                const float* a_col = a + i0 * lda + kk;
+                for (int ii = 0; ii < tm; ii++)
+                    y_buf[ii] = a_col[ii * lda];
+                
+                // B row: B[kk, j0..j0+tn-1] → x_buf  
+                float __attribute__((aligned(64))) x_buf[16] = {0};
+                const float* b_row = b + kk * ldb + j0;
+                for (int jj = 0; jj < tn; jj++)
+                    x_buf[jj] = b_row[jj];
+                
+                // ldy, ldx, fma32
+                AMX_OP_GPR(1, (uint64_t)y_buf);
+                AMX_OP_GPR(0, (uint64_t)x_buf);
+                AMX_OP_GPR(12, 0);
+            }
+            
+            // Store Z → C (accumulate)
+            for (int ii = 0; ii < tm; ii++) {
+                float __attribute__((aligned(64))) row_buf[16];
+                AMX_OP_GPR(5, ((uint64_t)row_buf) | ((uint64_t)(ii * 4) << 56));
+                float* c_row = c + (i0 + ii) * ldc + j0;
+                for (int jj = 0; jj < tn; jj++)
+                    c_row[jj] += row_buf[jj];
+            }
+        }
+    }
+}
+
+// Optimized version: processes 4 k-steps per iteration with NEON gathering
+void amx_strided_sgemm_tile_opt(
+    const float* a, int lda,
+    const float* b, int ldb,
+    float* c, int ldc,
+    int m, int k, int n)
+{
+    const int MR = 16, NR = 16;
+    
+    for (int i0 = 0; i0 < m; i0 += MR) {
+        int tm = MR < (m - i0) ? MR : (m - i0);
+        
+        // Precompute A row pointers for this tile
+        const float* a_rows[16];
+        for (int ii = 0; ii < tm; ii++)
+            a_rows[ii] = a + (i0 + ii) * lda;
+        
+        for (int j0 = 0; j0 < n; j0 += NR) {
+            int tn = NR < (n - j0) ? NR : (n - j0);
+            
+            // Zero Z
+            {
+                static const uint8_t zeros[64] __attribute__((aligned(128))) = {0};
+                uint64_t zb = (uint64_t)zeros;
+                for (int i = 0; i < 16; i++)
+                    AMX_OP_GPR(4, zb | ((uint64_t)(i * 4) << 56));
+            }
+            
+            // Main loop: 4 k-steps per iteration
+            float __attribute__((aligned(64))) y_buf[16];
+            float __attribute__((aligned(64))) x_buf[16];
+            int kk = 0;
+            
+            // For B rows that are contiguous and tn==16, load directly
+            if (tn == NR) {
+                for (; kk + 3 < k; kk += 4) {
+                    // k+0
+                    for (int ii = 0; ii < tm; ii++) y_buf[ii] = a_rows[ii][kk];
+                    for (int ii = tm; ii < 16; ii++) y_buf[ii] = 0;
+                    AMX_OP_GPR(1, (uint64_t)y_buf);
+                    AMX_OP_GPR(0, (uint64_t)(b + kk * ldb + j0));
+                    AMX_OP_GPR(12, 0);
+                    // k+1
+                    for (int ii = 0; ii < tm; ii++) y_buf[ii] = a_rows[ii][kk+1];
+                    for (int ii = tm; ii < 16; ii++) y_buf[ii] = 0;
+                    AMX_OP_GPR(1, (uint64_t)y_buf);
+                    AMX_OP_GPR(0, (uint64_t)(b + (kk+1) * ldb + j0));
+                    AMX_OP_GPR(12, 0);
+                    // k+2
+                    for (int ii = 0; ii < tm; ii++) y_buf[ii] = a_rows[ii][kk+2];
+                    for (int ii = tm; ii < 16; ii++) y_buf[ii] = 0;
+                    AMX_OP_GPR(1, (uint64_t)y_buf);
+                    AMX_OP_GPR(0, (uint64_t)(b + (kk+2) * ldb + j0));
+                    AMX_OP_GPR(12, 0);
+                    // k+3
+                    for (int ii = 0; ii < tm; ii++) y_buf[ii] = a_rows[ii][kk+3];
+                    for (int ii = tm; ii < 16; ii++) y_buf[ii] = 0;
+                    AMX_OP_GPR(1, (uint64_t)y_buf);
+                    AMX_OP_GPR(0, (uint64_t)(b + (kk+3) * ldb + j0));
+                    AMX_OP_GPR(12, 0);
+                }
+            }
+            
+            // Remainder
+            for (; kk < k; kk++) {
+                for (int ii = 0; ii < tm; ii++) y_buf[ii] = a_rows[ii][kk];
+                for (int ii = tm; ii < 16; ii++) y_buf[ii] = 0;
+                AMX_OP_GPR(1, (uint64_t)y_buf);
+                
+                if (tn == NR) {
+                    AMX_OP_GPR(0, (uint64_t)(b + kk * ldb + j0));
+                } else {
+                    for (int jj = 0; jj < 16; jj++) x_buf[jj] = 0;
+                    for (int jj = 0; jj < tn; jj++) x_buf[jj] = b[kk * ldb + j0 + jj];
+                    AMX_OP_GPR(0, (uint64_t)x_buf);
+                }
+                AMX_OP_GPR(12, 0);
+            }
+            
+            // Store Z → C (accumulate)
+            for (int ii = 0; ii < tm; ii++) {
+                float __attribute__((aligned(64))) row_buf[16];
+                AMX_OP_GPR(5, ((uint64_t)row_buf) | ((uint64_t)(ii * 4) << 56));
+                float* c_row = c + (i0 + ii) * ldc + j0;
+                for (int jj = 0; jj < tn; jj++)
+                    c_row[jj] += row_buf[jj];
+            }
+        }
+    }
+}
+
 // ── GEBP packing helper ──────────────────────────────────────────────
 
 // Pack A panel for GEBP: A[i_start..i_end, k_start..k_end] → dst
