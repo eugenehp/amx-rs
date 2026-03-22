@@ -108,6 +108,15 @@ extern "C" {
     /// NEON f32 dot product — much faster than AMX for this operation.
     pub fn neon_f32_dot(a: *const f32, b: *const f32, n: i32) -> f32;
 
+    /// Full tile loop: processes tile range [start..end) in a single C call.
+    /// Eliminates Rust→C FFI overhead per tile.
+    pub fn amx_f32_tile_loop(
+        a_packed: *const u8, b_packed: *const u8,
+        c_out: *mut f32, z_buf: *mut u8,
+        m: i32, k: i32, n: i32,
+        tile_start: i32, tile_end: i32,
+    );
+
     /// Strided sgemm: C += A*B directly from row-major sources (no packing)
     pub fn amx_strided_sgemm_tile(
         a: *const f32, lda: i32,

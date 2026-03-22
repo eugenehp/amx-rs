@@ -541,6 +541,46 @@ void amx_f32_tile_kernel_4y_accum(const void* a_panel, const void* b_panel,
     }
 }
 
+// ── Full tile-loop kernel (eliminates Rust→C FFI per tile) ───────────
+//
+// Processes ALL (i_tile, j_tile) pairs in a single C call.
+// Eliminates the ~160ns/tile overhead from Rust pointer math + FFI.
+void amx_f32_tile_loop(
+    const void* a_packed, const void* b_packed,
+    float* c_out, void* z_buf,
+    int m, int k, int n,
+    int tile_start, int tile_end)
+{
+    const int TILE = 16;
+    const int TILE_BYTES = 64;
+    int n_i_tiles = (m + TILE - 1) / TILE;
+    int n_j_tiles = (n + TILE - 1) / TILE;
+    
+    const uint8_t* ap_base = (const uint8_t*)a_packed;
+    const uint8_t* bp_base = (const uint8_t*)b_packed;
+    uint8_t* zb = (uint8_t*)z_buf;
+
+    for (int idx = tile_start; idx < tile_end; idx++) {
+        int it = idx / n_j_tiles;
+        int jt = idx % n_j_tiles;
+        int i_blk = it * TILE;
+        int j_blk = jt * TILE;
+        int tile_m = TILE < (m - i_blk) ? TILE : (m - i_blk);
+        int tile_n = TILE < (n - j_blk) ? TILE : (n - j_blk);
+
+        const uint8_t* ap = ap_base + it * k * TILE_BYTES;
+        const uint8_t* bp = bp_base + jt * k * TILE_BYTES;
+
+        amx_f32_tile_kernel_4y(ap, bp, zb, k, tile_m);
+
+        for (int ii = 0; ii < tile_m; ii++) {
+            const float* src = (const float*)(zb + ii * TILE_BYTES);
+            float* dst = c_out + (i_blk + ii) * n + j_blk;
+            __builtin_memcpy(dst, src, tile_n * sizeof(float));
+        }
+    }
+}
+
 // ── Strided AMX kernel (no pre-packing) ──────────────────────────────
 //
 // Computes C[m×n] += A[m×k] × B[k×n] directly from row-major strided

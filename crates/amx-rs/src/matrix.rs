@@ -319,13 +319,8 @@ impl Matrix<f32> {
 
                 #[cfg(feature = "std")]
                 {
-                    if total_ops > 200_000_000 && m.min(k).min(n) >= 64 {
-                        // Large: GEBP with cache blocking
-                        let nt = std::thread::available_parallelism()
-                            .map(|n| n.get()).unwrap_or(1);
-                        return self.matmul_gebp_parallel(other, nt);
-                    } else if total_tiles >= 16 {
-                        // Medium: pool (tiles distributed across workers)
+                    if total_tiles >= 16 {
+                        // Pool: single C tile-loop call per worker, near-zero overhead
                         return self.matmul_pool(other);
                     } else {
                         // Small: single-thread AMX
@@ -461,15 +456,18 @@ impl Matrix<f32> {
         let b_packed = aligned_alloc(b_pack_size, 64);
         unsafe { pack_b_tiles(b.as_ptr(), k, n, n_j_tiles, b_packed); }
 
-        // ── Tile loop ────────────────────────────────────────────────
+        // ── Tile loop (single C call for all tiles) ─────────────────
         let mut c_data = vec![0.0f32; m * n];
         let z_buf = aligned_alloc(TILE * TILE_BYTES, 64);
+        let total_tiles = n_i_tiles * n_j_tiles;
 
         unsafe {
             amx_sys::amx_set();
-            compute_tile_range(
-                a_packed, b_packed, c_data.as_mut_ptr(), z_buf,
-                0, n_i_tiles, m, k, n, n_j_tiles,
+            amx_sys::amx_f32_tile_loop(
+                a_packed, b_packed,
+                c_data.as_mut_ptr(), z_buf,
+                m as i32, k as i32, n as i32,
+                0, total_tiles as i32,
             );
             amx_sys::amx_clr();
         }

@@ -127,49 +127,15 @@ mod inner {
 
     #[inline(never)]
     unsafe fn execute_tiles(job: &TileJob, z_buf: *mut u8) {
-        let a_packed = job.a_packed as *const u8;
-        let b_packed = job.b_packed as *const u8;
-        let c_out = job.c_out as *mut f32;
-        let m = job.m;
-        let k = job.k;
-        let n = job.n;
-        let n_j_tiles = job.n_j_tiles;
-        let kc = 512usize;
-
-        for idx in job.tile_start..job.tile_end {
-            let it = idx / n_j_tiles;
-            let jt = idx % n_j_tiles;
-            let i_blk = it * TILE;
-            let j_blk = jt * TILE;
-            let tile_m = TILE.min(m - i_blk);
-            let tile_n = TILE.min(n - j_blk);
-
-            let ap = a_packed.add(it * k * TILE_BYTES);
-            let bp = b_packed.add(jt * k * TILE_BYTES);
-
-            if k > kc {
-                let mut first = true;
-                let mut ks = 0;
-                while ks < k {
-                    let akc = kc.min(k - ks);
-                    if first {
-                        amx_sys::amx_f32_tile_kernel_4y(ap.add(ks * TILE_BYTES), bp.add(ks * TILE_BYTES), z_buf, akc as i32, tile_m as i32);
-                        first = false;
-                    } else {
-                        amx_sys::amx_f32_tile_kernel_4y_accum(ap.add(ks * TILE_BYTES), bp.add(ks * TILE_BYTES), z_buf, akc as i32, tile_m as i32);
-                    }
-                    ks += kc;
-                }
-            } else {
-                amx_sys::amx_f32_tile_kernel_4y(ap, bp, z_buf, k as i32, tile_m as i32);
-            }
-
-            for ii in 0..tile_m {
-                let src = z_buf.add(ii * TILE_BYTES) as *const f32;
-                let dst = c_out.add((i_blk + ii) * n + j_blk);
-                core::ptr::copy_nonoverlapping(src, dst, tile_n);
-            }
-        }
+        // Single C call for ALL tiles — eliminates per-tile FFI overhead
+        amx_sys::amx_f32_tile_loop(
+            job.a_packed as *const u8,
+            job.b_packed as *const u8,
+            job.c_out as *mut f32,
+            z_buf,
+            job.m as i32, job.k as i32, job.n as i32,
+            job.tile_start as i32, job.tile_end as i32,
+        );
     }
 
     pub(crate) unsafe fn pool_dispatch_tiles(
