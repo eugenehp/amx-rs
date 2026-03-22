@@ -319,11 +319,13 @@ impl Matrix<f32> {
 
                 #[cfg(feature = "std")]
                 {
-                    if total_tiles >= 64 {
-                        // Pool: single C tile-loop call per worker, near-zero overhead
+                    // Pool for all sizes ≥ 2 i-tile rows.
+                    // Small (N<256): shared B + i-row distribution
+                    // Large (N≥256): also uses shared B + i-row distribution
+                    //   (workers cap at n_i_tiles, load balance is fine)
+                    if n_i_tiles >= 2 {
                         return self.matmul_pool(other);
                     } else {
-                        // Small: single-thread AMX
                         return self.matmul_amx(other);
                     }
                 }

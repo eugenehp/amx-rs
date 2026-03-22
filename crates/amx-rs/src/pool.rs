@@ -27,10 +27,10 @@ mod inner {
     #[repr(C)]
     struct SgemmJob {
         a: usize, lda: usize,
-        b_packed: usize,  // pointer to shared pre-packed B
+        b_packed: usize,
         c: usize, ldc: usize,
         m: usize, k: usize, n: usize,
-        tile_start: usize, tile_end: usize,
+        tile_start: usize, tile_end: usize, // i-row range
     }
 
     struct AmxPool {
@@ -154,9 +154,12 @@ mod inner {
             return;
         }
 
-        // Distribute i-tile ROWS across workers.
-        // Each worker processes all j-tiles for its i-rows.
-        // This maximizes A-pack reuse and minimizes contention.
+        // Distribution strategy:
+        // For small matrices (≤ 128 i-tiles per worker): distribute by i-rows.
+        //   Each worker packs A once per row + processes all j-tiles.
+        //   Good A-pack amortization, low contention.
+        // For large matrices: more workers get diminishing returns from
+        //   redundant B packing in each worker. Cap at a sweet spot.
         let active = nw.min(n_i_tiles);
         let rows_per = (n_i_tiles + active - 1) / active;
 
