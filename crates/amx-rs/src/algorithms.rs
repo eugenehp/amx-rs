@@ -3,6 +3,20 @@
 use crate::error::AmxResult;
 use crate::matrix::Matrix;
 
+/// Precision mode for matrix operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Precision {
+    /// Default f32 accumulation — fastest, hardware-native precision.
+    Fast,
+    /// f64 accumulation for scalar fallback — ~2× slower but near-f64 precision.
+    /// On AMX hardware, this is equivalent to `Fast` (hardware only supports f32).
+    High,
+}
+
+impl Default for Precision {
+    fn default() -> Self { Precision::Fast }
+}
+
 /// Builder for matrix multiplication operations
 pub struct MatMulBuilder {
     /// Transpose A before multiplication
@@ -13,6 +27,8 @@ pub struct MatMulBuilder {
     pub alpha: f32,
     /// Beta scaling factor for accumulation
     pub beta: f32,
+    /// Precision mode
+    pub precision: Precision,
 }
 
 impl MatMulBuilder {
@@ -23,6 +39,7 @@ impl MatMulBuilder {
             transpose_b: false,
             alpha: 1.0,
             beta: 0.0,
+            precision: Precision::Fast,
         }
     }
 
@@ -50,15 +67,41 @@ impl MatMulBuilder {
         self
     }
 
+    /// Set precision mode
+    pub fn precision(mut self, precision: Precision) -> Self {
+        self.precision = precision;
+        self
+    }
+
     /// Execute the matrix multiplication using AMX hardware acceleration.
     ///
     /// Computes `C = alpha * A * B`.  If `transpose_a` or `transpose_b` are set
     /// the corresponding matrix is transposed before multiplication.
+    ///
+    /// When `precision` is `High` and AMX is not available, uses f64
+    /// accumulation for better numerical stability.
     pub fn execute(&self, a: &Matrix<f32>, b: &Matrix<f32>) -> AmxResult<Matrix<f32>> {
         let a_eff = if self.transpose_a { a.transpose()? } else { a.clone() };
         let b_eff = if self.transpose_b { b.transpose()? } else { b.clone() };
 
-        let mut c = a_eff.matmul(&b_eff)?;
+        let mut c = match self.precision {
+            Precision::Fast => a_eff.matmul(&b_eff)?,
+            Precision::High => {
+                // Try AMX first (hardware precision), fall back to f64 scalar
+                #[cfg(target_arch = "aarch64")]
+                {
+                    if amx_sys::is_amx_available() {
+                        a_eff.matmul(&b_eff)?
+                    } else {
+                        a_eff.matmul_f64(&b_eff)?
+                    }
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    a_eff.matmul_f64(&b_eff)?
+                }
+            }
+        };
 
         // Apply alpha scaling
         if (self.alpha - 1.0).abs() > f32::EPSILON {
@@ -141,6 +184,29 @@ mod tests {
         assert!(builder.transpose_a);
         assert!(!builder.transpose_b);
         assert_eq!(builder.alpha, 2.0);
+    }
+
+    #[test]
+    fn test_matmul_builder_precision() {
+        let builder = MatMulBuilder::new()
+            .precision(Precision::High);
+        assert_eq!(builder.precision, Precision::High);
+    }
+
+    #[test]
+    fn test_matmul_builder_execute_high_precision() {
+        let a = Matrix::from_data(vec![1.0, 2.0, 3.0, 4.0], 2, 2).unwrap();
+        let b = Matrix::from_data(vec![5.0, 6.0, 7.0, 8.0], 2, 2).unwrap();
+        let c = MatMulBuilder::new()
+            .precision(Precision::High)
+            .execute(&a, &b)
+            .unwrap();
+        assert_eq!(c.dims(), (2, 2));
+        let s = c.as_slice();
+        assert!((s[0] - 19.0).abs() < 1e-4);
+        assert!((s[1] - 22.0).abs() < 1e-4);
+        assert!((s[2] - 43.0).abs() < 1e-4);
+        assert!((s[3] - 50.0).abs() < 1e-4);
     }
 
     #[test]

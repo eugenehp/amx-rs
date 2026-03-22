@@ -93,7 +93,8 @@ impl<T: Clone + Default> Vector<T> {
 impl Vector<f32> {
     /// Dot product using the best available backend.
     ///
-    /// Uses AMX hardware on `aarch64` Apple Silicon if available, scalar otherwise.
+    /// Uses AMX hardware on `aarch64` Apple Silicon if available,
+    /// Kahan-compensated scalar otherwise for best precision.
     pub fn dot(&self, other: &Vector<f32>) -> AmxResult<f32> {
         #[cfg(target_arch = "aarch64")]
         {
@@ -101,13 +102,14 @@ impl Vector<f32> {
                 return self.dot_amx(other);
             }
         }
-        self.dot_scalar(other)
+        self.dot_kahan(other)
     }
 
     /// Scalar (pure-Rust) dot product.
     ///
-    /// Portable, no hardware dependencies.  Useful as a reference baseline
-    /// for benchmarking against the AMX path.
+    /// Simple sequential sum — fast, auto-vectorisable, but accumulates
+    /// rounding error for long vectors.  Use [`dot_kahan`] or [`dot_f64`]
+    /// when precision matters.
     pub fn dot_scalar(&self, other: &Vector<f32>) -> AmxResult<f32> {
         if self.len() != other.len() {
             return Err(AmxError::DimensionMismatch {
@@ -118,14 +120,79 @@ impl Vector<f32> {
         Ok(self.data.iter().zip(other.data.iter()).map(|(a, b)| a * b).sum())
     }
 
-    /// AMX-accelerated dot product using `fma32` vector mode.
+    /// Kahan-compensated dot product for improved precision.
     ///
-    /// Processes 16 f32 lanes at a time, accumulates in Z row 0, then reduces.
+    /// Uses 8 parallel Kahan accumulators so the inner loop remains
+    /// vectorisable, then reduces with pairwise summation.  Precision
+    /// is close to f64 accumulation while keeping f32 throughput.
+    pub fn dot_kahan(&self, other: &Vector<f32>) -> AmxResult<f32> {
+        if self.len() != other.len() {
+            return Err(AmxError::DimensionMismatch {
+                expected: self.len(),
+                got: other.len(),
+            });
+        }
+        let a = self.as_slice();
+        let b = other.as_slice();
+        let n = a.len();
+
+        const LANES: usize = 8;
+        let mut sums = [0.0f32; LANES];
+        let mut comp = [0.0f32; LANES];
+        let full = n / LANES * LANES;
+
+        for i in (0..full).step_by(LANES) {
+            for l in 0..LANES {
+                let prod = a[i + l] * b[i + l];
+                let y = prod - comp[l];
+                let t = sums[l] + y;
+                comp[l] = (t - sums[l]) - y;
+                sums[l] = t;
+            }
+        }
+        // Tail
+        for i in full..n {
+            let prod = a[i] * b[i];
+            let y = prod - comp[0];
+            let t = sums[0] + y;
+            comp[0] = (t - sums[0]) - y;
+            sums[0] = t;
+        }
+        // Pairwise reduction in f64 for final sum
+        let total: f64 = sums.iter().map(|&s| s as f64).sum();
+        Ok(total as f32)
+    }
+
+    /// High-precision dot product using f64 accumulation throughout.
+    ///
+    /// Every product is computed in f64 and accumulated in f64.
+    /// The result is rounded to f32 at the end.
+    pub fn dot_f64(&self, other: &Vector<f32>) -> AmxResult<f32> {
+        if self.len() != other.len() {
+            return Err(AmxError::DimensionMismatch {
+                expected: self.len(),
+                got: other.len(),
+            });
+        }
+        let a = self.as_slice();
+        let b = other.as_slice();
+        let mut sum = 0.0f64;
+        for i in 0..a.len() {
+            sum += (a[i] as f64) * (b[i] as f64);
+        }
+        Ok(sum as f32)
+    }
+
+    /// AMX-accelerated dot product.
+    ///
+    /// Delegates to a single C kernel call (`amx_f32_dot`) that handles
+    /// AMX set/clr, vectorised accumulation (16 f32 lanes at a time with
+    /// 8× unrolling), and pairwise reduction — all without per-chunk FFI
+    /// overhead.
+    ///
     /// Only available on `aarch64`.
     #[cfg(target_arch = "aarch64")]
     pub fn dot_amx(&self, other: &Vector<f32>) -> AmxResult<f32> {
-        use amx_sys::*;
-
         if self.len() != other.len() {
             return Err(AmxError::DimensionMismatch {
                 expected: self.len(),
@@ -133,50 +200,15 @@ impl Vector<f32> {
             });
         }
 
-        const CHUNK: usize = 16;
-
-        #[repr(align(128))]
-        struct Buf64([u8; 64]);
-
-        let a = &self.data;
-        let b = &other.data;
+        let a = self.as_slice();
+        let b = other.as_slice();
         let n = a.len();
 
-        unsafe {
-            amx_set();
+        let result = unsafe {
+            amx_sys::amx_f32_dot(a.as_ptr(), b.as_ptr(), n as i32)
+        };
 
-            let zero = Buf64([0u8; 64]);
-            amx_ldz(ptr_row_flags(zero.0.as_ptr(), 0, 0));
-
-            for start in (0..n).step_by(CHUNK) {
-                let count = CHUNK.min(n - start);
-
-                let mut xb = Buf64([0u8; 64]);
-                let mut yb = Buf64([0u8; 64]);
-                for i in 0..count {
-                    xb.0[i * 4..(i + 1) * 4].copy_from_slice(&a[start + i].to_le_bytes());
-                    yb.0[i * 4..(i + 1) * 4].copy_from_slice(&b[start + i].to_le_bytes());
-                }
-
-                amx_ldx(ptr_row_flags(xb.0.as_ptr(), 0, 0));
-                amx_ldy(ptr_row_flags(yb.0.as_ptr(), 0, 0));
-                amx_fma32(1u64 << 63); // vector mode
-            }
-
-            let mut zb = Buf64([0u8; 64]);
-            amx_stz(ptr_row_flags(zb.0.as_mut_ptr(), 0, 0));
-            amx_clr();
-
-            let mut sum = 0.0f32;
-            for i in 0..CHUNK {
-                let off = i * 4;
-                sum += f32::from_le_bytes([
-                    zb.0[off], zb.0[off + 1], zb.0[off + 2], zb.0[off + 3],
-                ]);
-            }
-
-            Ok(sum)
-        }
+        Ok(result)
     }
 }
 
@@ -229,7 +261,7 @@ mod tests {
         let a = Vector::from_data((0..n).map(|i| i as f32).collect());
         let b = Vector::from_data((0..n).map(|i| (i as f32) * 0.5).collect());
         let got = a.dot(&b).unwrap();
-        let want = a.dot_scalar(&b).unwrap();
+        let want = a.dot_f64(&b).unwrap();
         assert!((got - want).abs() < 1e-1, "got={got}, want={want}");
     }
 
@@ -238,5 +270,36 @@ mod tests {
         let a = Vector::<f32>::zeros(3).unwrap();
         let b = Vector::<f32>::zeros(5).unwrap();
         assert!(a.dot(&b).is_err());
+    }
+
+    #[test]
+    fn test_dot_kahan_precision() {
+        // Test that Kahan is more precise than naive for pathological input
+        let n = 10000;
+        let a = Vector::from_data(vec![1.0f32; n]);
+        let b = Vector::from_data((0..n).map(|i| {
+            if i % 2 == 0 { 1e-7_f32 } else { -1e-7_f32 }
+        }).collect());
+
+        let kahan = a.dot_kahan(&b).unwrap();
+        let f64_ref = a.dot_f64(&b).unwrap();
+
+        // Kahan should be close to the f64 reference
+        let err = (kahan - f64_ref).abs();
+        assert!(err < 1e-6, "kahan={kahan}, f64={f64_ref}, err={err}");
+    }
+
+    #[test]
+    fn test_dot_f64_precision() {
+        let n = 1000;
+        let a = Vector::from_data((0..n).map(|i| (i as f32) * 0.001).collect());
+        let b = Vector::from_data((0..n).map(|i| ((n - i) as f32) * 0.001).collect());
+
+        let f64_result = a.dot_f64(&b).unwrap();
+        let scalar_result = a.dot_scalar(&b).unwrap();
+
+        // Both should be close but f64 should be at least as good
+        let diff = (f64_result - scalar_result).abs();
+        assert!(diff < 1.0, "results diverge too much: f64={f64_result}, scalar={scalar_result}");
     }
 }

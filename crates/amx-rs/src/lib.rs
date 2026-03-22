@@ -36,7 +36,7 @@ pub mod macros;
 pub use error::{AmxError, AmxResult};
 pub use matrix::Matrix;
 pub use vector::Vector;
-pub use algorithms::{MatMulBuilder, ConvBuilder};
+pub use algorithms::{MatMulBuilder, ConvBuilder, Precision};
 
 /// AMX-rs version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

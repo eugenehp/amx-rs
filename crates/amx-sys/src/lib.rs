@@ -69,10 +69,19 @@ extern "C" {
     pub fn amx_f32_zero_z();
     pub fn amx_f32_mac_tile(a_panel: *const u8, b_panel: *const u8, k: i32);
     pub fn amx_f32_store_z(dst: *mut u8, rows: i32);
+    pub fn amx_f32_load_z(src: *const u8, rows: i32);
     pub fn amx_f32_tile_kernel(
         a_panel: *const u8, b_panel: *const u8,
         dst: *mut u8, k: i32, tile_m: i32,
     );
+    pub fn amx_f32_tile_kernel_accum(
+        a_panel: *const u8, b_panel: *const u8,
+        dst: *mut u8, k: i32, tile_m: i32,
+    );
+
+    // Complete dot product: set, zero, accumulate, reduce, clr.
+    // Single FFI call for the entire operation.
+    pub fn amx_f32_dot(a: *const f32, b: *const f32, n: i32) -> f32;
 }
 
 /// Returns `true` if AMX instructions are available on this CPU.
