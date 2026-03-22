@@ -439,7 +439,10 @@ impl Matrix<f32> {
     /// 4. **AMX single-threaded**: medium matrices on no_std.
     pub fn matmul(&self, other: &Matrix<f32>) -> AmxResult<Matrix<f32>> {
         let (m, k) = self.dims();
-        let (_k2, n) = other.dims();
+        let (k2, n) = other.dims();
+        if k != k2 {
+            return Err(AmxError::DimensionMismatch { expected: k, got: k2 });
+        }
 
         #[cfg(target_arch = "aarch64")]
         {
@@ -447,15 +450,10 @@ impl Matrix<f32> {
                 let max_dim = m.max(n).max(k);
                 let total_ops = m * k * n;
 
-                // Tiny matrices: NEON
-                if max_dim <= 32 && total_ops <= 65536 {
-                    return self.matmul_neon(other);
-                }
-
-                // On macOS: route through Accelerate for everything else
+                // On macOS: route through Accelerate for everything
                 #[cfg(target_os = "macos")]
                 {
-                    // CblasTrans with cached A for aligned medium sizes
+                    // CblasTrans with cached A: best when m is 16-aligned and N≤1024
                     if m % 16 == 0 && n <= 1024 && m >= 32 && n >= 32 {
                         let (a_col, a_stride) = self.ensure_col_cache();
                         let mut c_data = Vec::with_capacity(m * n);
@@ -470,7 +468,8 @@ impl Matrix<f32> {
                         }
                         return Matrix::from_data(c_data, m, n);
                     }
-                    // Everything else: standard Accelerate NoTrans
+                    // Everything else (including tiny, m=1, n=1, non-aligned):
+                    // Accelerate NoTrans — it handles all shapes efficiently
                     {
                         let mut c_data = Vec::with_capacity(m * n);
                         unsafe { c_data.set_len(m * n); }
@@ -484,6 +483,11 @@ impl Matrix<f32> {
                         }
                         return Matrix::from_data(c_data, m, n);
                     }
+                }
+
+                // Non-macOS: NEON for tiny, AMX pool for rest
+                if max_dim <= 32 && total_ops <= 65536 {
+                    return self.matmul_neon(other);
                 }
 
                 // GEBP with full cache blocking for large matrices;
