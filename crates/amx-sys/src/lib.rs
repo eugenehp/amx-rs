@@ -107,6 +107,14 @@ extern "C" {
 
     /// NEON f32 dot product — much faster than AMX for this operation.
     pub fn neon_f32_dot(a: *const f32, b: *const f32, n: i32) -> f32;
+
+    /// GEBP A-panel packing with column-gather into MR=16 vectors.
+    pub fn gebp_pack_a_panel(
+        a: *const f32, lda: i32,
+        i_start: i32, i_end: i32,
+        k_start: i32, k_end: i32,
+        dst: *mut f32,
+    );
 }
 
 /// Returns `true` if AMX instructions are available on this CPU.

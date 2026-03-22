@@ -119,6 +119,8 @@ impl CsvRow {
 // Matmul measurement
 // ---------------------------------------------------------------------------
 
+// Returns: (scalar_us, smart_us, gebp_us, gebp_par_us, blas_us,
+//           gf_scalar, gf_smart, gf_gebp, gf_gebp_par, gf_blas)
 fn measure_matmul(
     m: usize, k: usize, n: usize,
     base_iters: u32, n_threads: usize, has_amx: bool,
@@ -134,18 +136,20 @@ fn measure_matmul(
 
     let t_scalar = bench_fn(|| { black_box(a.matmul_scalar(&b).unwrap()); }, iters);
 
-    // Smart dispatch (uses NEON for small, AMX for large)
+    // Smart dispatch (now routes to GEBP)
     let t_smart = if has_amx {
         bench_fn(|| { black_box(a.matmul(&b).unwrap()); }, iters)
     } else { t_scalar };
 
-    let t_amx = if has_amx {
-        bench_fn(|| { black_box(a.matmul_amx(&b).unwrap()); }, iters)
+    // GEBP single-threaded
+    let t_gebp = if has_amx {
+        bench_fn(|| { black_box(a.matmul_gebp(&b).unwrap()); }, iters)
     } else { t_scalar };
 
-    let t_amx_par = if has_amx && n_threads > 1 {
-        bench_fn(|| { black_box(a.matmul_amx_parallel(&b, n_threads).unwrap()); }, iters)
-    } else { t_amx };
+    // GEBP parallel
+    let t_gebp_par = if has_amx && n_threads > 1 {
+        bench_fn(|| { black_box(a.matmul_gebp_parallel(&b, n_threads).unwrap()); }, iters)
+    } else { t_gebp };
 
     let t_blas = bench_fn(|| {
         c_raw.fill(0.0);
@@ -155,12 +159,12 @@ fn measure_matmul(
 
     let gf_s = flops / t_scalar / 1e9;
     let gf_smart = flops / t_smart / 1e9;
-    let gf_a = flops / t_amx / 1e9;
-    let gf_ap = flops / t_amx_par / 1e9;
+    let gf_g = flops / t_gebp / 1e9;
+    let gf_gp = flops / t_gebp_par / 1e9;
     let gf_b = flops / t_blas / 1e9;
 
-    (t_scalar * 1e6, t_smart * 1e6, t_amx * 1e6, t_amx_par * 1e6, t_blas * 1e6,
-     gf_s, gf_smart, gf_a, gf_ap, gf_b)
+    (t_scalar * 1e6, t_smart * 1e6, t_gebp * 1e6, t_gebp_par * 1e6, t_blas * 1e6,
+     gf_s, gf_smart, gf_g, gf_gp, gf_b)
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +204,7 @@ fn main() {
     println!();
     println!("  SQUARE MATMUL f32 (N×N × N×N)");
     println!("  {:>5}  {:>8} {:>8} {:>8} {:>8} {:>8}  {:>6} {:>6} {:>6} {:>6} {:>6}",
-        "N", "scalar", "smart", "AMX", "AMX-par", "Accel", "GFs", "GFsm", "GFa", "GFap", "GFbl");
+        "N", "scalar", "smart", "GEBP", "GEBP-par", "Accel", "GFs", "GFsm", "GFg", "GFgp", "GFbl");
     println!("  {}", "─".repeat(110));
 
     for &sz in &sq_sizes {
@@ -234,7 +238,7 @@ fn main() {
     println!();
     println!("  RECTANGULAR MATMUL f32 (M×K × K×N)");
     println!("  {:>16}  {:>8} {:>8} {:>8} {:>8} {:>8}  {:>6} {:>6} {:>6} {:>6} {:>6}",
-        "shape", "scalar", "smart", "AMX", "AMX-par", "Accel", "GFs", "GFsm", "GFa", "GFap", "GFbl");
+        "shape", "scalar", "smart", "GEBP", "GEBP-par", "Accel", "GFs", "GFsm", "GFg", "GFgp", "GFbl");
     println!("  {}", "─".repeat(118));
 
     for &(m,k,n) in &rect {

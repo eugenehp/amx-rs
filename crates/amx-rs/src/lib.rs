@@ -32,6 +32,7 @@ pub mod matrix;
 pub mod vector;
 pub mod algorithms;
 pub mod macros;
+pub mod gebp;
 
 pub use error::{AmxError, AmxResult};
 pub use matrix::Matrix;

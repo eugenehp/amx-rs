@@ -422,6 +422,40 @@ void amx_f32_tile_kernel_2j(const void* a_panel,
         AMX_OP_GPR(5, ((uint64_t)(p1 + i * 64)) | ((uint64_t)(i * 4) << 56));
 }
 
+// ── GEBP packing helper ──────────────────────────────────────────────
+
+// Pack A panel for GEBP: A[i_start..i_end, k_start..k_end] → dst
+// with column-gather into MR=16 wide vectors.
+// row-major: A[i,j] = a[i*lda + j]
+void gebp_pack_a_panel(const float* a, int lda,
+                        int i_start, int i_end,
+                        int k_start, int k_end,
+                        float* dst) {
+    const int MR = 16;
+    int mc = i_end - i_start;
+    int kc = k_end - k_start;
+    int n_i_tiles = (mc + MR - 1) / MR;
+
+    for (int it = 0; it < n_i_tiles; it++) {
+        int i_blk = i_start + it * MR;
+        int tile_m = MR < (i_end - i_blk) ? MR : (i_end - i_blk);
+        float* out = dst + it * kc * MR;
+
+        // Precompute row pointers
+        const float* rows[16];
+        for (int ii = 0; ii < tile_m; ii++)
+            rows[ii] = a + (i_blk + ii) * lda + k_start;
+
+        for (int kk = 0; kk < kc; kk++) {
+            float* d = out + kk * MR;
+            for (int ii = 0; ii < tile_m; ii++)
+                d[ii] = rows[ii][kk];
+            for (int ii = tile_m; ii < MR; ii++)
+                d[ii] = 0.0f;
+        }
+    }
+}
+
 // ── NEON kernels ─────────────────────────────────────────────────────
 
 #include <arm_neon.h>

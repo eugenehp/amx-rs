@@ -125,11 +125,11 @@ fn transpose_block<T: Clone + Default>(
 // f32 matrix multiplication — scalar and AMX implementations
 // ---------------------------------------------------------------------------
 
-const TILE: usize = 16;
-const TILE_BYTES: usize = TILE * 4; // 64 bytes — one AMX register width
+pub(crate) const TILE: usize = 16;
+pub(crate) const TILE_BYTES: usize = TILE * 4; // 64 bytes — one AMX register width
 
 /// Allocate `size` bytes with `align`-byte alignment (zeroed).
-fn aligned_alloc(size: usize, align: usize) -> *mut u8 {
+pub(crate) fn aligned_alloc(size: usize, align: usize) -> *mut u8 {
     if size == 0 { return align as *mut u8; }
     let layout = alloc::alloc::Layout::from_size_align(size, align)
         .expect("invalid layout");
@@ -141,7 +141,7 @@ fn aligned_alloc(size: usize, align: usize) -> *mut u8 {
 }
 
 /// Free memory allocated with `aligned_alloc`.
-fn aligned_free(ptr: *mut u8, size: usize, align: usize) {
+pub(crate) fn aligned_free(ptr: *mut u8, size: usize, align: usize) {
     if size == 0 { return; }
     let layout = alloc::alloc::Layout::from_size_align(size, align)
         .expect("invalid layout");
@@ -309,16 +309,33 @@ impl Matrix<f32> {
                     return self.matmul_neon(other);
                 }
 
+                // GEBP with full cache blocking for large matrices;
+                // direct AMX tiling for medium matrices where GEBP packing
+                // overhead would dominate.
+                // GEBP wins at large sizes where cache blocking matters.
+                // Below ~500×500×500, the packing overhead dominates.
+                let total_ops = m * k * n;
+                let min_dim = m.min(k).min(n);
+                let use_gebp = total_ops > 200_000_000 && min_dim >= 64; // ~585×585×585
+
                 #[cfg(feature = "std")]
                 {
                     let n_threads = std::thread::available_parallelism()
                         .map(|n| n.get())
                         .unwrap_or(1);
-                    return self.matmul_amx_parallel(other, n_threads);
+                    if use_gebp {
+                        return self.matmul_gebp_parallel(other, n_threads);
+                    } else {
+                        return self.matmul_amx_parallel(other, n_threads);
+                    }
                 }
                 #[cfg(not(feature = "std"))]
                 {
-                    return self.matmul_amx(other);
+                    if use_gebp {
+                        return self.matmul_gebp(other);
+                    } else {
+                        return self.matmul_amx(other);
+                    }
                 }
             }
         }
@@ -679,7 +696,7 @@ impl Matrix<f32> {
 
 /// Wrapper to send raw pointers across thread boundaries.
 #[derive(Clone, Copy)]
-struct SendPtr<T>(*mut T);
+pub(crate) struct SendPtr<T>(pub(crate) *mut T);
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 
