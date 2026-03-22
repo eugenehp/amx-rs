@@ -456,19 +456,24 @@ impl Matrix<f32> {
         let b_packed = aligned_alloc(b_pack_size, 64);
         unsafe { pack_b_tiles(b.as_ptr(), k, n, n_j_tiles, b_packed); }
 
-        // ── Tile loop (single C call for all tiles) ─────────────────
+        // ── Tile-row loop: process all j-tiles per i-tile row ────────
         let mut c_data = vec![0.0f32; m * n];
         let z_buf = aligned_alloc(TILE * TILE_BYTES, 64);
-        let total_tiles = n_i_tiles * n_j_tiles;
 
         unsafe {
             amx_sys::amx_set();
-            amx_sys::amx_f32_tile_loop(
-                a_packed, b_packed,
-                c_data.as_mut_ptr(), z_buf,
-                m as i32, k as i32, n as i32,
-                0, total_tiles as i32,
-            );
+            for it in 0..n_i_tiles {
+                let i_blk = it * TILE;
+                let tile_m = TILE.min(m - i_blk);
+                amx_sys::amx_f32_tilerow(
+                    a_packed.add(it * k * TILE_BYTES),
+                    b_packed,
+                    c_data.as_mut_ptr().add(i_blk * n),
+                    z_buf,
+                    k as i32, n as i32, n as i32,
+                    tile_m as i32, n_j_tiles as i32,
+                );
+            }
             amx_sys::amx_clr();
         }
 

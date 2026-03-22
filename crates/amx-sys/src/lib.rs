@@ -111,6 +111,14 @@ extern "C" {
     /// Pack B tiles into contiguous layout.
     pub fn amx_pack_b(b: *const f32, ldb: i32, k: i32, n: i32, dst: *mut u8);
 
+    /// Process all j-tiles for one i-tile row in a single call.
+    pub fn amx_f32_tilerow(
+        a_packed: *const u8, b_packed: *const u8,
+        c_row: *mut f32, z_buf: *mut u8,
+        k: i32, n: i32, ldc: i32,
+        tile_m: i32, n_j_tiles: i32,
+    );
+
     /// Worker: uses shared pre-packed B, packs only own A tiles.
     pub fn amx_sgemm_worker(
         a: *const f32, lda: i32,

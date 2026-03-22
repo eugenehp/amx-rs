@@ -130,16 +130,14 @@ mod inner {
         m: usize, k: usize, n: usize,
     ) {
         let n_i_tiles = (m + TILE - 1) / TILE;
-        let n_j_tiles = (n + TILE - 1) / TILE;
-        let total_tiles = n_i_tiles * n_j_tiles;
 
         let pool = get_pool();
         let nw = pool.n_workers;
 
-        // Pack B ONCE on main thread (shared by all workers)
+        // Pack B ONCE on main thread
         amx_sys::amx_pack_b(b, ldb as i32, k as i32, n as i32, pool.b_pack);
 
-        if nw == 0 || total_tiles < 4 {
+        if nw == 0 || n_i_tiles < 2 {
             let a_buf = aligned_alloc(MAX_K_BUF * TILE_BYTES, 128);
             let z_buf = aligned_alloc(16 * TILE_BYTES, 128);
             amx_sys::amx_set();
@@ -147,7 +145,7 @@ mod inner {
                 a, lda as i32, pool.b_pack,
                 c, ldc as i32,
                 m as i32, k as i32, n as i32,
-                0, total_tiles as i32,
+                0, n_i_tiles as i32,
                 a_buf, z_buf,
             );
             amx_sys::amx_clr();
@@ -156,20 +154,28 @@ mod inner {
             return;
         }
 
-        // Distribute tiles across all workers
-        let tiles_per = (total_tiles + nw - 1) / nw;
+        // Distribute i-tile ROWS across workers.
+        // Each worker processes all j-tiles for its i-rows.
+        // This maximizes A-pack reuse and minimizes contention.
+        let active = nw.min(n_i_tiles);
+        let rows_per = (n_i_tiles + active - 1) / active;
+
         for i in 0..nw {
-            let start = i * tiles_per;
-            let end = ((i + 1) * tiles_per).min(total_tiles);
             let slot = &pool.slots[i];
             let job = &mut *slot.job.get();
-            *job = SgemmJob {
-                a: a as usize, lda,
-                b_packed: pool.b_pack as usize,
-                c: c as usize, ldc,
-                m, k, n,
-                tile_start: start, tile_end: end,
-            };
+            if i < active {
+                let start = i * rows_per;
+                let end = ((i + 1) * rows_per).min(n_i_tiles);
+                *job = SgemmJob {
+                    a: a as usize, lda,
+                    b_packed: pool.b_pack as usize,
+                    c: c as usize, ldc,
+                    m, k, n,
+                    tile_start: start, tile_end: end,
+                };
+            } else {
+                *job = core::mem::zeroed();
+            }
         }
 
         let gen = pool.generation.fetch_add(1, Ordering::Release) + 1;
