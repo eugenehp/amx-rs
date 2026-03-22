@@ -312,6 +312,47 @@ impl<T> Drop for Matrix<T> {
 }
 
 impl Matrix<f32> {
+    /// Multiply into caller-provided output buffer. Zero allocation overhead.
+    /// Output must be m×n elements. Panics if too small.
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    pub fn matmul_into(&self, other: &Matrix<f32>, out: &mut [f32]) -> AmxResult<()> {
+        let (m, k) = self.dims();
+        let (k2, n) = other.dims();
+        if k != k2 { return Err(AmxError::DimensionMismatch { expected: k, got: k2 }); }
+        assert!(out.len() >= m * n);
+
+        if !amx_sys::is_amx_available() || m <= 1 || n <= 1 {
+            let c = self.matmul(other)?;
+            out[..m*n].copy_from_slice(c.as_slice());
+            return Ok(());
+        }
+
+        let b_ptr = other.as_slice().as_ptr();
+        let b_aligned = (b_ptr as usize) % 64 == 0 && (n * 4) % 64 == 0;
+        let n_i_tiles = (m + TILE - 1) / TILE;
+
+        if b_aligned && n % 16 == 0 && n <= 256 && m % 16 == 0 && n_i_tiles >= 2 {
+            let (a_col, a_stride) = self.ensure_col_cache();
+            unsafe {
+                crate::pool::pool_sgemm_with_flag(
+                    a_col, a_stride, b_ptr, n,
+                    out.as_mut_ptr(), n, m, k, n, 4,
+                );
+            }
+        } else if n_i_tiles >= 2 {
+            unsafe {
+                crate::pool::pool_sgemm(
+                    self.as_slice().as_ptr(), k, b_ptr, n,
+                    out.as_mut_ptr(), n, m, k, n,
+                );
+            }
+        } else {
+            let c = self.matmul(other)?;
+            out[..m*n].copy_from_slice(c.as_slice());
+        }
+        Ok(())
+    }
+
     /// Get or create column-major cache for zero-overhead AMX loading.
     /// First call transposes A (O(m×k)). Subsequent calls return cached pointer.
     #[cfg(target_arch = "aarch64")]
