@@ -32,7 +32,7 @@
 
 use alloc::vec;
 use crate::error::{AmxError, AmxResult};
-use crate::matrix::{Matrix, TILE, TILE_BYTES, aligned_alloc, aligned_free, SendPtr};
+use crate::matrix::{Matrix, TILE, TILE_BYTES, aligned_alloc, aligned_free};
 
 // ═══════════════════════════════════════════════════════════════════════
 // GEBP blocking parameters — tuned for Apple Silicon M1-M4
@@ -365,7 +365,7 @@ impl Matrix<f32> {
                 let actual_mc = self.ic_end - self.ic_start;
                 let actual_nc = self.jc_end - self.jc_start;
                 let mc_tiles = (actual_mc + MR - 1) / MR;
-                let nc_tiles = (actual_nc + NR - 1) / NR;
+                let _nc_tiles = (actual_nc + NR - 1) / NR;
 
                 // Pack Ã for this thread's row range
                 let a_buf_size = mc_tiles * self.actual_kc * TILE_BYTES;
@@ -382,7 +382,7 @@ impl Matrix<f32> {
                 // B̃ panel offset for this j-range
                 // B̃ is packed for the full NC range starting at jc=0 of the
                 // current NC block. We need the j-tile offset within that block.
-                let j_offset_tiles = (self.jc_start - self.jc_start) / NR; // always 0 for per-tile dispatch
+                let _j_offset_tiles = (self.jc_start - self.jc_start) / NR; // always 0 for per-tile dispatch
 
                 // Pin to P-core for maximum AMX throughput
                 #[cfg(target_os = "macos")]
@@ -542,7 +542,7 @@ impl Matrix<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
+    
 
     fn make_matrix(m: usize, n: usize) -> Matrix<f32> {
         let data: Vec<f32> = (0..m * n)

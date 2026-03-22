@@ -241,6 +241,7 @@ const KC_BLOCK: usize = 512;
 /// All pointers must be valid.  `c_out` rows in [start_it*TILE .. end_it*TILE]
 /// must not be written by any other thread.
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)]
 unsafe fn compute_tile_range(
     a_packed: *const u8, // packed A for this range (start from index 0)
     b_packed: *const u8, // packed B for all j-tiles
@@ -417,10 +418,10 @@ impl Matrix<f32> {
                 // GEBP with full cache blocking for large matrices;
                 // direct AMX tiling for medium matrices where GEBP packing
                 // overhead would dominate.
-                let total_ops = m * k * n;
+                let _total_ops = m * k * n;
                 let n_i_tiles = (m + TILE - 1) / TILE;
                 let n_j_tiles = (n + TILE - 1) / TILE;
-                let total_tiles = n_i_tiles * n_j_tiles;
+                let _total_tiles = n_i_tiles * n_j_tiles;
 
                 #[cfg(feature = "std")]
                 {
@@ -428,7 +429,7 @@ impl Matrix<f32> {
                         // For small aligned matrices: use cached column-major A
                         // through the pool with direct_b=4 (zero transpose per call).
                         let b_ptr = other.as_slice().as_ptr();
-                        let b_aligned = (b_ptr as usize) % 64 == 0 && (n * 4) % 64 == 0;
+                        let _b_aligned = (b_ptr as usize) % 64 == 0 && (n * 4) % 64 == 0;
                         // Use cached transpose + Accelerate's CblasTrans for max speed.
                         // Accelerate with CblasTrans skips internal transpose → 1.7× faster.
                         #[cfg(target_os = "macos")]

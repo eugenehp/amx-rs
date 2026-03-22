@@ -41,7 +41,7 @@ mod inner {
         slots: Vec<WorkerSlot>,
         n_workers: usize,
         b_pack: *mut u8,
-        b_pack_size: usize,
+        #[allow(dead_code)] b_pack_size: usize,
     }
 
     static mut POOL: *const AmxPool = core::ptr::null();
@@ -284,6 +284,7 @@ pub(crate) use inner::pool_sgemm_with_flag;
 
 
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
+#[allow(dead_code)]
 pub(crate) unsafe fn pool_dispatch_tiles(
     a_packed: *const u8, b_packed: *const u8,
     c_out: *mut f32, m: usize, k: usize, n: usize,

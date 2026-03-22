@@ -5,5 +5,7 @@ fn main() {
         .flag_if_supported("-march=native")
         .flag_if_supported("-mtune=native")
         .flag_if_supported("-funroll-loops")
+        .flag_if_supported("-Wno-unused-parameter")
+        .flag_if_supported("-Wno-unused-variable")
         .compile("amx");
 }

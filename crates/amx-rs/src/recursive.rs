@@ -54,6 +54,7 @@ impl Drop for ScratchBufs {
 /// Pack A[m×k] from strided source into MR-wide contiguous layout.
 /// a points to A[0,0]; A[i,j] = a[i*lda + j].
 #[inline]
+#[allow(dead_code)]
 unsafe fn pack_a_leaf(
     a: *const f32, lda: usize,
     m: usize, k: usize,
@@ -74,6 +75,7 @@ unsafe fn pack_a_leaf(
 /// Pack B[k×n] from strided source into NR-wide contiguous layout.
 /// b points to B[0,0]; B[i,j] = b[i*ldb + j].
 #[inline]
+#[allow(dead_code)]
 unsafe fn pack_b_leaf(
     b: *const f32, ldb: usize,
     k: usize, n: usize,
@@ -301,7 +303,7 @@ impl Matrix<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec;
+    
 
     fn make(m: usize, n: usize) -> Matrix<f32> {
         Matrix::from_data(
