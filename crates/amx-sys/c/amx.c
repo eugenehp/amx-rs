@@ -939,9 +939,50 @@ void amx_sgemm_worker(
         //
         // For tile_m=16: fma uses rows 0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60
         // Remaining: rows 1,2,3,5,6,7,9,10,11,...  = 48 available rows
-        // Each A row = 64 bytes = 1 Z row. With k up to 48, we can fit 48 k-steps!
-        //
-        // For larger k, process in KC blocks of 48.
+        // Column-major A: ldy directly, zero transpose. Apple's approach.
+        if (direct_b == 4) {
+            int njt = (n + TILE - 1) / TILE;
+            for (int jt = 0; jt < njt; jt++) {
+                int j_blk = jt * TILE;
+                int tn = TILE < (n - j_blk) ? TILE : (n - j_blk);
+                uint8_t* zd = z_buf + jt * tile_m * TILE_BYTES;
+                static const uint8_t zz4[64] __attribute__((aligned(128))) = {0};
+                for (int r = 0; r < 16; r++)
+                    AMX_OP_GPR(4, (uint64_t)zz4 | ((uint64_t)(r*4) << 56));
+                int kkk = 0;
+                for (; kkk + 3 < k; kkk += 4) {
+                    // a is column-major: a[i_blk + kk*lda] = contiguous 16 floats
+                    AMX_OP_GPR(1, (uint64_t)(a + i_blk + (kkk+0)*lda) | (0ULL<<56));
+                    AMX_OP_GPR(1, (uint64_t)(a + i_blk + (kkk+1)*lda) | (1ULL<<56));
+                    AMX_OP_GPR(1, (uint64_t)(a + i_blk + (kkk+2)*lda) | (2ULL<<56));
+                    AMX_OP_GPR(1, (uint64_t)(a + i_blk + (kkk+3)*lda) | (3ULL<<56));
+                    AMX_OP_GPR(0, (uint64_t)(b + (kkk+0)*ldb + j_blk));
+                    AMX_OP_GPR(12, 0x00);
+                    AMX_OP_GPR(0, (uint64_t)(b + (kkk+1)*ldb + j_blk));
+                    AMX_OP_GPR(12, 0x40);
+                    AMX_OP_GPR(0, (uint64_t)(b + (kkk+2)*ldb + j_blk));
+                    AMX_OP_GPR(12, 0x80);
+                    AMX_OP_GPR(0, (uint64_t)(b + (kkk+3)*ldb + j_blk));
+                    AMX_OP_GPR(12, 0xC0);
+                }
+                for (; kkk < k; kkk++) {
+                    AMX_OP_GPR(1, (uint64_t)(a + i_blk + kkk*lda));
+                    AMX_OP_GPR(0, (uint64_t)(b + kkk*ldb + j_blk));
+                    AMX_OP_GPR(12, 0);
+                }
+                for (int r = 0; r < tile_m; r++)
+                    AMX_OP_GPR(5, ((uint64_t)(zd + r*64)) | ((uint64_t)(r*4) << 56));
+            }
+            for (int ii = 0; ii < tile_m; ii++)
+                for (int jt = 0; jt < (n+TILE-1)/TILE; jt++) {
+                    int j_blk = jt*TILE;
+                    int tn = TILE<(n-j_blk)?TILE:(n-j_blk);
+                    __builtin_memcpy(c+(i_blk+ii)*ldc+j_blk,
+                        z_buf+(jt*tile_m+ii)*TILE_BYTES, tn*4);
+                }
+            continue;
+        }
+
         if (direct_b == 3) {
             int n_j_tiles_local = (n + TILE - 1) / TILE;
             const int KC = 48; // max k-steps that fit in non-fma Z rows

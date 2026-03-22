@@ -4,12 +4,28 @@ use alloc::{vec, vec::Vec};
 use core::fmt;
 use crate::error::{AmxError, AmxResult};
 
-/// Generic matrix type supporting AMX operations
+/// Generic matrix type supporting AMX operations.
+///
+/// For f32 on aarch64: lazily caches a column-major copy of the data
+/// on first matmul. Subsequent matmuls with the same matrix skip the
+/// transpose entirely — matching Apple Accelerate's zero-overhead approach.
 pub struct Matrix<T> {
     data: Vec<T>,
     rows: usize,
     cols: usize,
+    /// Cached column-major layout (f32 only, aarch64 only).
+    /// col_ptr[i + k * rows_padded] = data[i * cols + k]
+    /// rows_padded = (rows + 15) & !15 for AMX alignment.
+    #[cfg(target_arch = "aarch64")]
+    col_ptr: core::cell::UnsafeCell<*mut f32>,
+    #[cfg(target_arch = "aarch64")]
+    col_stride: core::cell::UnsafeCell<usize>,
 }
+
+// Safety: col_ptr is lazily initialized and then immutable.
+// Only written once under the check `col_ptr.is_null()`.
+unsafe impl<T: Send> Send for Matrix<T> {}
+unsafe impl<T: Sync> Sync for Matrix<T> {}
 
 impl<T: Clone + Default> Matrix<T> {
     /// Create a new matrix filled with zeros
@@ -17,7 +33,12 @@ impl<T: Clone + Default> Matrix<T> {
         let capacity = rows.checked_mul(cols)
             .ok_or(AmxError::AllocationFailed)?;
         let data = vec![T::default(); capacity];
-        Ok(Matrix { data, rows, cols })
+        Ok(Matrix { data, rows, cols,
+            #[cfg(target_arch = "aarch64")]
+            col_ptr: core::cell::UnsafeCell::new(core::ptr::null_mut()),
+            #[cfg(target_arch = "aarch64")]
+            col_stride: core::cell::UnsafeCell::new(0),
+        })
     }
 
     /// Create a new matrix from flat data
@@ -28,7 +49,12 @@ impl<T: Clone + Default> Matrix<T> {
                 got: data.len(),
             });
         }
-        Ok(Matrix { data, rows, cols })
+        Ok(Matrix { data, rows, cols,
+            #[cfg(target_arch = "aarch64")]
+            col_ptr: core::cell::UnsafeCell::new(core::ptr::null_mut()),
+            #[cfg(target_arch = "aarch64")]
+            col_stride: core::cell::UnsafeCell::new(0),
+        })
     }
 
     /// Get matrix dimensions
@@ -271,7 +297,45 @@ unsafe fn compute_tile_range(
     }
 }
 
+impl<T> Drop for Matrix<T> {
+    fn drop(&mut self) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let ptr = unsafe { *self.col_ptr.get() };
+            if !ptr.is_null() {
+                let stride = unsafe { *self.col_stride.get() };
+                let size = stride * self.cols * 4;
+                aligned_free(ptr as *mut u8, size, 128);
+            }
+        }
+    }
+}
+
 impl Matrix<f32> {
+    /// Get or create column-major cache for zero-overhead AMX loading.
+    /// First call transposes A (O(m×k)). Subsequent calls return cached pointer.
+    #[cfg(target_arch = "aarch64")]
+    fn ensure_col_cache(&self) -> (*const f32, usize) {
+        let ptr = unsafe { *self.col_ptr.get() };
+        if !ptr.is_null() {
+            return (ptr as *const f32, unsafe { *self.col_stride.get() });
+        }
+        let m = self.rows;
+        let k = self.cols;
+        let rp = (m + 15) & !15;
+        let size = rp * k * 4;
+        let new_ptr = aligned_alloc(size, 128) as *mut f32;
+        unsafe {
+            for kk in 0..k {
+                for i in 0..m { *new_ptr.add(i + kk * rp) = self.data[i * k + kk]; }
+                for i in m..rp { *new_ptr.add(i + kk * rp) = 0.0; }
+            }
+            *self.col_ptr.get() = new_ptr;
+            *self.col_stride.get() = rp;
+        }
+        (new_ptr as *const f32, rp)
+    }
+
     /// Matrix multiplication using the best available backend.
     ///
     /// Dispatch strategy (determined empirically on Apple M1-M4):
@@ -320,6 +384,25 @@ impl Matrix<f32> {
                 #[cfg(feature = "std")]
                 {
                     if n_i_tiles >= 2 {
+                        // For small aligned matrices: use cached column-major A
+                        // through the pool with direct_b=4 (zero transpose per call).
+                        let b_ptr = other.as_slice().as_ptr();
+                        let b_aligned = (b_ptr as usize) % 64 == 0 && (n * 4) % 64 == 0;
+                        if b_aligned && n % 16 == 0 && n <= 256 && m % 16 == 0 {
+                            let (a_col, a_stride) = self.ensure_col_cache();
+                            let mut c_data = Vec::with_capacity(m * n);
+                            unsafe { c_data.set_len(m * n); }
+                            unsafe {
+                                // Pass column-major A to pool with direct_b=4
+                                crate::pool::pool_sgemm(
+                                    a_col, a_stride,
+                                    b_ptr, n,
+                                    c_data.as_mut_ptr(), n,
+                                    m, k, n,
+                                );
+                            }
+                            return Matrix::from_data(c_data, m, n);
+                        }
                         return self.matmul_pool(other);
                     } else {
                         return self.matmul_amx(other);
@@ -814,6 +897,10 @@ impl<T: Clone + Default> Clone for Matrix<T> {
             data: self.data.clone(),
             rows: self.rows,
             cols: self.cols,
+            #[cfg(target_arch = "aarch64")]
+            col_ptr: core::cell::UnsafeCell::new(core::ptr::null_mut()),
+            #[cfg(target_arch = "aarch64")]
+            col_stride: core::cell::UnsafeCell::new(0),
         }
     }
 }

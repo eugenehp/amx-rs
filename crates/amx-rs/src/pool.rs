@@ -146,7 +146,8 @@ mod inner {
         // Check if B can be loaded directly (requires 64-byte alignment)
         let b_aligned = (b as usize) % 64 == 0 && (ldb * 4) % 64 == 0;
         // n must be multiple of 16 for direct B (no zero-padding needed)
-        let direct_b: i32 = if b_aligned && n % 16 == 0 && n <= 256 { 1 } else { 0 };
+        let is_col_major = lda != k; // column-major A has lda = rows_padded != k
+        let direct_b: i32 = if is_col_major && b_aligned && n % 16 == 0 { 4 } else if b_aligned && n % 16 == 0 && n <= 256 { 1 } else { 0 };
 
         if nw == 0 || n_i_tiles < 2 {
             if direct_b == 0 {
