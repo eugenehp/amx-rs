@@ -146,7 +146,7 @@ mod inner {
         // Check if B can be loaded directly (requires 64-byte alignment)
         let b_aligned = (b as usize) % 64 == 0 && (ldb * 4) % 64 == 0;
         // n must be multiple of 16 for direct B (no zero-padding needed)
-        let direct_b = b_aligned && n % 16 == 0;
+        let direct_b = b_aligned && n % 16 == 0 && n <= 256;
 
         if nw == 0 || n_i_tiles < 2 {
             if !direct_b {
