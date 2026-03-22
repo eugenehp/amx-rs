@@ -99,6 +99,9 @@ mod inner {
             let _ = pthread_set_qos_class_self_np(0x21, 0);
         }
 
+        // Keep AMX enabled permanently — no per-dispatch amx_set/clr overhead
+        unsafe { amx_sys::amx_set(); }
+
         let mut my_gen = 0u32;
         loop {
             // Spin on THIS worker's per-worker generation
@@ -112,17 +115,16 @@ mod inner {
             let job = unsafe { &*slot.job.get() };
             if job.tile_start < job.tile_end {
                 unsafe {
-                    amx_sys::amx_set();
+                    // AMX stays set permanently — no amx_set/clr per dispatch
                     amx_sys::amx_sgemm_worker(
                         job.a as *const f32, job.lda as i32,
-                        job.b_packed as *const f32, job.ldc as i32, // b or b_packed
+                        job.b_packed as *const f32, job.ldc as i32,
                         job.c as *mut f32, job.ldc as i32,
                         job.m as i32, job.k as i32, job.n as i32,
                         job.tile_start as i32, job.tile_end as i32,
                         slot.a_pack, slot.z_buf,
-                        job.b_ready_gen as i32, // reuse as direct_b flag
+                        job.b_ready_gen as i32,
                     );
-                    amx_sys::amx_clr();
                 }
             }
 
