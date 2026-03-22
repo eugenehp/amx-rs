@@ -584,6 +584,28 @@ void amx_f32_tile_loop(
 // Forward declarations
 void neon_pack_a_tiles(const float* a, int m, int k, int start_it, int end_it, uint8_t* dst);
 
+// ── Batch store kernel: process i-row, store ALL j-tiles at once ─────
+//
+// Instead of store-Z per j-tile (86ns each), this stores all 
+// 16×N results to a contiguous buffer with ONE batch of stz calls.
+void amx_f32_tilerow_batch(
+    const uint8_t* a_packed,
+    const uint8_t* b_packed, 
+    uint8_t* z_out_buf,  // Must be n_j_tiles * 16 * 64 bytes
+    int k, int n, 
+    int tile_m, int n_j_tiles)
+{
+    const int TILE = 16;
+    const int TILE_BYTES = 64;
+    
+    for (int jt = 0; jt < n_j_tiles; jt++) {
+        const uint8_t* bp = b_packed + jt * k * TILE_BYTES;
+        uint8_t* z_dst = z_out_buf + jt * tile_m * TILE_BYTES;
+        
+        amx_f32_tile_kernel_4y(a_packed, bp, z_dst, k, tile_m);
+    }
+}
+
 // ── Multi-tile row kernel: process all j-tiles for one i-tile row ────
 //
 // Keeps Z loaded across j-tiles of the SAME i-tile row.
@@ -645,9 +667,8 @@ void amx_pack_b(const float* b, int ldb, int k, int n, uint8_t* dst) {
     }
 }
 
-// Worker: packs A, waits for shared B, then computes.
-// b_ready_flag: pointer to atomic uint32 that main thread bumps after B packing.
-// b_ready_gen: the generation value to wait for.
+// Worker: packs A, waits for shared B, computes all j-tiles per i-row.
+// Uses batch compute: all j-tiles into contiguous z_buf, then copy to C.
 void amx_sgemm_worker(
     const float* a, int lda,
     const uint8_t* b_packed,
@@ -665,7 +686,7 @@ void amx_sgemm_worker(
         int i_blk = it * TILE;
         int tile_m = TILE < (m - i_blk) ? TILE : (m - i_blk);
         
-        // Pack A for this i-tile row (overlaps with main thread's B packing)
+        // Pack A for this i-tile row
         neon_pack_a_tiles(a, m, lda, it, it + 1, a_pack_buf);
         
         // Wait for B to be ready (first iteration only)
@@ -674,10 +695,24 @@ void amx_sgemm_worker(
                 __asm__ volatile("yield");
         }
         
-        // Process all j-tiles for this row
-        amx_f32_tilerow(a_pack_buf, b_packed,
-            c + i_blk * ldc, z_buf,
-            k, n, ldc, tile_m, n_j_tiles);
+        // Compute all j-tiles, storing to contiguous z_buf
+        for (int jt = 0; jt < n_j_tiles; jt++) {
+            const uint8_t* bp = b_packed + jt * k * TILE_BYTES;
+            uint8_t* z_dst = z_buf + jt * tile_m * TILE_BYTES;
+            amx_f32_tile_kernel_4y(a_pack_buf, bp, z_dst, k, tile_m);
+        }
+        
+        // Bulk copy z_buf → C row
+        for (int ii = 0; ii < tile_m; ii++) {
+            for (int jt = 0; jt < n_j_tiles; jt++) {
+                int j_blk = jt * TILE;
+                int tile_n = TILE < (n - j_blk) ? TILE : (n - j_blk);
+                __builtin_memcpy(
+                    c + (i_blk + ii) * ldc + j_blk,
+                    z_buf + (jt * tile_m + ii) * TILE_BYTES,
+                    tile_n * sizeof(float));
+            }
+        }
     }
 }
 

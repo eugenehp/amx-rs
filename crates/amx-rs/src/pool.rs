@@ -59,11 +59,13 @@ mod inner {
 
                 let mut slots = Vec::with_capacity(n_workers);
                 for _ in 0..n_workers {
+                    // z_buf sized for max n_j_tiles × 16 rows × 64 bytes
+                    let z_sz = MAX_N_TILES * 16 * TILE_BYTES;
                     slots.push(WorkerSlot {
                         done_gen: AtomicU32::new(0),
                         job: UnsafeCell::new(core::mem::zeroed()),
                         a_pack: aligned_alloc(a_sz, 128),
-                        z_buf: aligned_alloc(16 * TILE_BYTES, 128),
+                        z_buf: aligned_alloc(z_sz, 128),
                     });
                 }
 
