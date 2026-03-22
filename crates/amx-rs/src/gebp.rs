@@ -182,7 +182,6 @@ unsafe fn gebp_macro_kernel(
             let bp = b_packed.add(jr * kc * TILE_BYTES);
 
             if first_kc {
-                // First KC block: zero + compute
                 amx_f32_tile_kernel(ap, bp, z_buf, kc as i32, tile_m as i32);
             } else {
                 // Subsequent KC blocks: load partial sums from C into z_buf,

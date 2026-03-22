@@ -424,6 +424,126 @@ void amx_f32_tile_kernel_2j(const void* a_panel,
 
 #include <arm_neon.h>
 
+// ── Apple-style 4×Y micro-kernel ─────────────────────────────────────
+//
+// Like Accelerate's cblas_sgemm_singlecore: preload 4 Y registers (4 A columns)
+// then for each B row (X), issue 4 fma32s with different Y offsets.
+// This gives 4 fma32 per X load instead of 1.
+//
+// a_panel: k contiguous 64-byte vectors (packed A column-gathered)
+// b_panel: k contiguous 64-byte vectors (packed B row-copied)
+// dst:     MR*TILE_BYTES output buffer
+// k:       number of rank-1 updates
+// tile_m:  actual rows (≤16)
+void amx_f32_tile_kernel_4y(const void* a_panel, const void* b_panel,
+                             void* dst, int k, int tile_m) {
+    // Zero Z
+    static const uint8_t zeros[64] __attribute__((aligned(128))) = {0};
+    uint64_t zbase = (uint64_t)zeros;
+    for (int i = 0; i < 16; i++) {
+        AMX_OP_GPR(4, zbase | ((uint64_t)(i * 4) << 56));
+    }
+
+    const uint8_t* ap = (const uint8_t*)a_panel;
+    const uint8_t* bp = (const uint8_t*)b_panel;
+
+    // Main loop: process 4 k-steps per iteration
+    // Load 4 A columns into Y[0..3], then for each B row load + fma32
+    //
+    // fma32 operand Y-pair selection (from Apple's Accelerate):
+    //   From Apple's Accelerate: operand bits for Y register selection
+    //   Y register row is encoded in the Y offset field (bits 19:10)
+    //   Y row 0 = 0 byte offset, Y row 1 = 64 byte offset, etc.
+    #define FMA32_Y(row) ((uint64_t)(row) * 64 << 10)
+
+    int kk = 0;
+    for (; kk + 3 < k; kk += 4) {
+        // Preload 4 A columns into Y[0..3]
+        AMX_OP_GPR(1, (uint64_t)(ap + (kk+0) * 64) | (0ULL << 56));
+        AMX_OP_GPR(1, (uint64_t)(ap + (kk+1) * 64) | (1ULL << 56));
+        AMX_OP_GPR(1, (uint64_t)(ap + (kk+2) * 64) | (2ULL << 56));
+        AMX_OP_GPR(1, (uint64_t)(ap + (kk+3) * 64) | (3ULL << 56));
+
+        // B[kk+0] into X[0], fma32 X[0]*Y[0]
+        AMX_OP_GPR(0, (uint64_t)(bp + (kk+0) * 64));
+        AMX_OP_GPR(12, FMA32_Y(0));
+
+        // B[kk+1] into X[0], fma32 X[0]*Y[1]
+        AMX_OP_GPR(0, (uint64_t)(bp + (kk+1) * 64));
+        AMX_OP_GPR(12, FMA32_Y(1));
+
+        // B[kk+2] into X[0], fma32 X[0]*Y[2]
+        AMX_OP_GPR(0, (uint64_t)(bp + (kk+2) * 64));
+        AMX_OP_GPR(12, FMA32_Y(2));
+
+        // B[kk+3] into X[0], fma32 X[0]*Y[3]
+        AMX_OP_GPR(0, (uint64_t)(bp + (kk+3) * 64));
+        AMX_OP_GPR(12, FMA32_Y(3));
+    }
+
+    #undef FMA32_Y
+
+    // Remainder: 1 at a time
+    for (; kk < k; kk++) {
+        AMX_OP_GPR(1, (uint64_t)(ap + kk * 64));
+        AMX_OP_GPR(0, (uint64_t)(bp + kk * 64));
+        AMX_OP_GPR(12, 0);
+    }
+
+    // Store
+    uint8_t* p = (uint8_t*)dst;
+    for (int i = 0; i < tile_m; i++) {
+        AMX_OP_GPR(5, ((uint64_t)(p + i * 64)) | ((uint64_t)(i * 4) << 56));
+    }
+}
+
+// Accumulating version of 4y kernel
+void amx_f32_tile_kernel_4y_accum(const void* a_panel, const void* b_panel,
+                                   void* dst, int k, int tile_m) {
+    // Load existing partial sums
+    const uint8_t* src = (const uint8_t*)dst;
+    for (int i = 0; i < tile_m; i++) {
+        AMX_OP_GPR(4, ((uint64_t)(src + i * 64)) | ((uint64_t)(i * 4) << 56));
+    }
+    static const uint8_t zeros[64] __attribute__((aligned(128))) = {0};
+    uint64_t zbase = (uint64_t)zeros;
+    for (int i = tile_m; i < 16; i++) {
+        AMX_OP_GPR(4, zbase | ((uint64_t)(i * 4) << 56));
+    }
+
+    const uint8_t* ap = (const uint8_t*)a_panel;
+    const uint8_t* bp = (const uint8_t*)b_panel;
+
+    #define FMA32_Y(row) ((uint64_t)(row) * 64 << 10)
+    int kk = 0;
+    for (; kk + 3 < k; kk += 4) {
+        AMX_OP_GPR(1, (uint64_t)(ap + (kk+0) * 64) | (0ULL << 56));
+        AMX_OP_GPR(1, (uint64_t)(ap + (kk+1) * 64) | (1ULL << 56));
+        AMX_OP_GPR(1, (uint64_t)(ap + (kk+2) * 64) | (2ULL << 56));
+        AMX_OP_GPR(1, (uint64_t)(ap + (kk+3) * 64) | (3ULL << 56));
+
+        AMX_OP_GPR(0, (uint64_t)(bp + (kk+0) * 64));
+        AMX_OP_GPR(12, FMA32_Y(0));
+        AMX_OP_GPR(0, (uint64_t)(bp + (kk+1) * 64));
+        AMX_OP_GPR(12, FMA32_Y(1));
+        AMX_OP_GPR(0, (uint64_t)(bp + (kk+2) * 64));
+        AMX_OP_GPR(12, FMA32_Y(2));
+        AMX_OP_GPR(0, (uint64_t)(bp + (kk+3) * 64));
+        AMX_OP_GPR(12, FMA32_Y(3));
+    }
+    #undef FMA32_Y
+    for (; kk < k; kk++) {
+        AMX_OP_GPR(1, (uint64_t)(ap + kk * 64));
+        AMX_OP_GPR(0, (uint64_t)(bp + kk * 64));
+        AMX_OP_GPR(12, 0);
+    }
+
+    uint8_t* p = (uint8_t*)dst;
+    for (int i = 0; i < tile_m; i++) {
+        AMX_OP_GPR(5, ((uint64_t)(p + i * 64)) | ((uint64_t)(i * 4) << 56));
+    }
+}
+
 // ── GEBP packing helper ──────────────────────────────────────────────
 
 // Pack A panel for GEBP: A[i_start..i_end, k_start..k_end] → dst

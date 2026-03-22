@@ -108,6 +108,17 @@ extern "C" {
     /// NEON f32 dot product — much faster than AMX for this operation.
     pub fn neon_f32_dot(a: *const f32, b: *const f32, n: i32) -> f32;
 
+    /// Apple-style 4×Y micro-kernel: 4 fma32 per X load
+    pub fn amx_f32_tile_kernel_4y(
+        a_panel: *const u8, b_panel: *const u8,
+        dst: *mut u8, k: i32, tile_m: i32,
+    );
+    /// Accumulating version of 4y kernel
+    pub fn amx_f32_tile_kernel_4y_accum(
+        a_panel: *const u8, b_panel: *const u8,
+        dst: *mut u8, k: i32, tile_m: i32,
+    );
+
     /// GEBP A-panel packing with column-gather into MR=16 vectors.
     pub fn gebp_pack_a_panel(
         a: *const f32, lda: i32,
