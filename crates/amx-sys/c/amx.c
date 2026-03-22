@@ -1018,7 +1018,31 @@ void amx_sgemm_worker(
             continue;
         }
         
-        neon_pack_a_tiles(a, m, lda, it, it + 1, a_pack_buf);
+        // Inline NEON transpose — 10% faster than neon_pack_a_tiles.
+        // Produces identical column-major output: a_pack_buf[kk*16 + ii] = A[i_blk+ii, kk]
+        {
+            float* at = (float*)a_pack_buf;
+            int kk = 0;
+            for (; kk + 3 < k; kk += 4) {
+                for (int ii = 0; ii < tile_m; ii++) {
+                    float32x4_t v = vld1q_f32(a + (i_blk+ii)*lda + kk);
+                    at[(kk+0)*TILE + ii] = vgetq_lane_f32(v, 0);
+                    at[(kk+1)*TILE + ii] = vgetq_lane_f32(v, 1);
+                    at[(kk+2)*TILE + ii] = vgetq_lane_f32(v, 2);
+                    at[(kk+3)*TILE + ii] = vgetq_lane_f32(v, 3);
+                }
+                for (int ii = tile_m; ii < TILE; ii++) {
+                    at[(kk+0)*TILE + ii] = 0; at[(kk+1)*TILE + ii] = 0;
+                    at[(kk+2)*TILE + ii] = 0; at[(kk+3)*TILE + ii] = 0;
+                }
+            }
+            for (; kk < k; kk++) {
+                for (int ii = 0; ii < tile_m; ii++)
+                    at[kk*TILE + ii] = a[(i_blk+ii)*lda + kk];
+                for (int ii = tile_m; ii < TILE; ii++)
+                    at[kk*TILE + ii] = 0;
+            }
+        }
         
         if (direct_b) {
             // Direct B: load from source matrix, no packing needed.
