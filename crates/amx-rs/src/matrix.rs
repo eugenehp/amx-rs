@@ -314,27 +314,21 @@ impl Matrix<f32> {
                 // overhead would dominate.
                 let total_ops = m * k * n;
                 let min_dim = m.min(k).min(n);
-                let use_gebp = total_ops > 200_000_000 && min_dim >= 64;
 
                 #[cfg(feature = "std")]
                 {
-                    if use_gebp {
+                    // Large matrices: GEBP with full cache blocking
+                    if total_ops > 200_000_000 && min_dim >= 64 {
                         let n_threads = std::thread::available_parallelism()
-                            .map(|n| n.get())
-                            .unwrap_or(1);
+                            .map(|n| n.get()).unwrap_or(1);
                         return self.matmul_gebp_parallel(other, n_threads);
-                    } else {
-                        // Use persistent AMX pool for near-zero dispatch overhead
-                        return self.matmul_pool(other);
                     }
+                    // Medium matrices: persistent pool (near-zero dispatch)
+                    return self.matmul_pool(other);
                 }
                 #[cfg(not(feature = "std"))]
                 {
-                    if use_gebp {
-                        return self.matmul_gebp(other);
-                    } else {
-                        return self.matmul_amx(other);
-                    }
+                    return self.matmul_amx(other);
                 }
             }
         }

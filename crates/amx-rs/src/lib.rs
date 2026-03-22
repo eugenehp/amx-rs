@@ -34,6 +34,7 @@ pub mod algorithms;
 pub mod macros;
 pub mod gebp;
 pub mod pool;
+pub mod recursive;
 
 pub use error::{AmxError, AmxResult};
 pub use matrix::Matrix;
