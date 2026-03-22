@@ -319,11 +319,15 @@ impl Matrix<f32> {
 
                 #[cfg(feature = "std")]
                 {
-                    // Pool for all sizes ≥ 2 i-tile rows.
-                    // Small (N<256): shared B + i-row distribution
-                    // Large (N≥256): also uses shared B + i-row distribution
-                    //   (workers cap at n_i_tiles, load balance is fine)
-                    if n_i_tiles >= 2 {
+                    if n_i_tiles >= 8 {
+                        // Large enough for pool (≥128 rows)
+                        return self.matmul_pool(other);
+                    } else if n_i_tiles >= 2 && total_ops > 500_000 {
+                        // Medium (64-112): zerocopy single-thread
+                        // Transpose A once + direct compute is faster than
+                        // pool overhead for small matrices
+                        return self.matmul_zerocopy(other);
+                    } else if n_i_tiles >= 2 {
                         return self.matmul_pool(other);
                     } else {
                         return self.matmul_amx(other);
