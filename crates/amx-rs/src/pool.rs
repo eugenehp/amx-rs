@@ -115,13 +115,12 @@ mod inner {
                     amx_sys::amx_set();
                     amx_sys::amx_sgemm_worker(
                         job.a as *const f32, job.lda as i32,
-                        job.b_packed as *const u8,
+                        job.b_packed as *const f32, job.ldc as i32, // b or b_packed
                         job.c as *mut f32, job.ldc as i32,
                         job.m as i32, job.k as i32, job.n as i32,
                         job.tile_start as i32, job.tile_end as i32,
                         slot.a_pack, slot.z_buf,
-                        job.b_ready_flag as *const u32,
-                        job.b_ready_gen,
+                        job.b_ready_gen as i32, // reuse as direct_b flag
                     );
                     amx_sys::amx_clr();
                 }
@@ -142,33 +141,44 @@ mod inner {
         let pool = get_pool();
         let nw = pool.n_workers;
 
+        // Check if B can be loaded directly (requires 64-byte alignment)
+        let b_aligned = (b as usize) % 64 == 0 && (ldb * 4) % 64 == 0;
+        // n must be multiple of 16 for direct B (no zero-padding needed)
+        let direct_b = b_aligned && n % 16 == 0;
+
         if nw == 0 || n_i_tiles < 2 {
-            amx_sys::amx_pack_b(b, ldb as i32, k as i32, n as i32, pool.b_pack);
+            if !direct_b {
+                amx_sys::amx_pack_b(b, ldb as i32, k as i32, n as i32, pool.b_pack);
+            }
+            let n_j_tiles = (n + 15) / 16;
+            let z_sz = n_j_tiles * 16 * TILE_BYTES;
             let a_buf = aligned_alloc(MAX_K_BUF * TILE_BYTES, 128);
-            let z_buf = aligned_alloc(16 * TILE_BYTES, 128);
-            let b_ready_gen = pool.b_ready.load(Ordering::Relaxed);
-            pool.b_ready.store(b_ready_gen + 1, Ordering::Release);
+            let z_buf = aligned_alloc(z_sz, 128);
             amx_sys::amx_set();
             amx_sys::amx_sgemm_worker(
-                a, lda as i32, pool.b_pack,
+                a, lda as i32,
+                if direct_b { b } else { pool.b_pack as *const f32 },
+                if direct_b { ldb as i32 } else { 0 },
                 c, ldc as i32,
                 m as i32, k as i32, n as i32,
                 0, n_i_tiles as i32,
                 a_buf, z_buf,
-                &pool.b_ready as *const AtomicU32 as *const u32,
-                b_ready_gen + 1,
+                if direct_b { 1 } else { 0 },
             );
             amx_sys::amx_clr();
             aligned_free(a_buf, MAX_K_BUF * TILE_BYTES, 128);
-            aligned_free(z_buf, 16 * TILE_BYTES, 128);
+            aligned_free(z_buf, z_sz, 128);
             return;
+        }
+
+        // Pack B on main thread (only if not using direct B)
+        if !direct_b {
+            amx_sys::amx_pack_b(b, ldb as i32, k as i32, n as i32, pool.b_pack);
         }
 
         let active = nw.min(n_i_tiles);
         let rows_per = (n_i_tiles + active - 1) / active;
-        let b_ready_gen = pool.b_ready.load(Ordering::Relaxed) + 1;
 
-        // Write jobs to workers (BEFORE packing B)
         for i in 0..nw {
             let slot = &pool.slots[i];
             let job = &mut *slot.job.get();
@@ -177,28 +187,20 @@ mod inner {
                 let end = ((i + 1) * rows_per).min(n_i_tiles);
                 *job = SgemmJob {
                     a: a as usize, lda,
-                    b_packed: pool.b_pack as usize,
+                    b_packed: if direct_b { b as usize } else { pool.b_pack as usize },
                     c: c as usize, ldc,
                     m, k, n,
                     tile_start: start, tile_end: end,
-                    b_ready_flag: &pool.b_ready as *const AtomicU32 as usize,
-                    b_ready_gen,
+                    b_ready_flag: 0,
+                    b_ready_gen: if direct_b { 1 } else { 0 }, // reused as direct_b flag
                 };
             } else {
                 *job = core::mem::zeroed();
             }
         }
 
-        // Wake workers — they start packing A immediately
         let gen = pool.generation.fetch_add(1, Ordering::Release) + 1;
 
-        // Main thread packs B IN PARALLEL with workers' A packing
-        amx_sys::amx_pack_b(b, ldb as i32, k as i32, n as i32, pool.b_pack);
-        
-        // Signal B is ready — workers waiting on this will proceed
-        pool.b_ready.store(b_ready_gen, Ordering::Release);
-
-        // Wait for workers to finish
         for i in 0..nw {
             let slot = &pool.slots[i];
             loop {

@@ -119,15 +119,15 @@ extern "C" {
         tile_m: i32, n_j_tiles: i32,
     );
 
-    /// Worker: packs A, waits for B ready signal, then computes.
+    /// Worker: packs A, loads B directly or from pre-packed buffer.
     pub fn amx_sgemm_worker(
         a: *const f32, lda: i32,
-        b_packed: *const u8,
+        b: *const f32, ldb: i32,  // raw B or cast from packed
         c: *mut f32, ldc: i32,
         m: i32, k: i32, n: i32,
         irow_start: i32, irow_end: i32,
         a_pack_buf: *mut u8, z_buf: *mut u8,
-        b_ready_flag: *const u32, b_ready_gen: u32,
+        direct_b: i32,  // 1 = direct B load, 0 = pre-packed
     );
 
     /// Full tile loop: processes tile range [start..end) in a single C call.

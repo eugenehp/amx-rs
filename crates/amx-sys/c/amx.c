@@ -667,16 +667,17 @@ void amx_pack_b(const float* b, int ldb, int k, int n, uint8_t* dst) {
     }
 }
 
-// Worker: packs A, waits for shared B, computes all j-tiles per i-row.
-// Uses batch compute: all j-tiles into contiguous z_buf, then copy to C.
+// Worker: packs A, loads B directly from source (no B packing needed).
+// Requires B to be aligned such that b + kk*ldb + j_blk is 64-byte aligned.
+// If not aligned, falls back to pre-packed B.
 void amx_sgemm_worker(
     const float* a, int lda,
-    const uint8_t* b_packed,
+    const float* b, int ldb,     // raw B pointer (or cast from packed)
     float* c, int ldc,
     int m, int k, int n,
     int irow_start, int irow_end,
     uint8_t* a_pack_buf, uint8_t* z_buf,
-    const volatile uint32_t* b_ready_flag, uint32_t b_ready_gen)
+    int direct_b)  // 1 = load B directly, 0 = b is pre-packed
 {
     const int TILE = 16;
     const int TILE_BYTES = 64;
@@ -686,23 +687,59 @@ void amx_sgemm_worker(
         int i_blk = it * TILE;
         int tile_m = TILE < (m - i_blk) ? TILE : (m - i_blk);
         
-        // Pack A for this i-tile row
         neon_pack_a_tiles(a, m, lda, it, it + 1, a_pack_buf);
         
-        // Wait for B to be ready (first iteration only)
-        if (it == irow_start) {
-            while (__atomic_load_n(b_ready_flag, __ATOMIC_ACQUIRE) < b_ready_gen)
-                __asm__ volatile("yield");
+        if (direct_b) {
+            // Direct B: load from source matrix, no packing needed.
+            // B rows are contiguous at b + kk*ldb + j_blk (64-byte aligned).
+            for (int jt = 0; jt < n_j_tiles; jt++) {
+                int j_blk = jt * TILE;
+                int tile_n = TILE < (n - j_blk) ? TILE : (n - j_blk);
+                uint8_t* z_dst = z_buf + jt * tile_m * TILE_BYTES;
+                
+                // Zero Z
+                static const uint8_t zeros[64] __attribute__((aligned(128))) = {0};
+                uint64_t zbase = (uint64_t)zeros;
+                for (int r = 0; r < 16; r++)
+                    AMX_OP_GPR(4, zbase | ((uint64_t)(r*4) << 56));
+                
+                #define FMA32_Y(row) ((uint64_t)(row) << 6)
+                int kk = 0;
+                for (; kk + 3 < k; kk += 4) {
+                    AMX_OP_GPR(1, (uint64_t)(a_pack_buf + (kk+0)*64) | (0ULL<<56));
+                    AMX_OP_GPR(1, (uint64_t)(a_pack_buf + (kk+1)*64) | (1ULL<<56));
+                    AMX_OP_GPR(1, (uint64_t)(a_pack_buf + (kk+2)*64) | (2ULL<<56));
+                    AMX_OP_GPR(1, (uint64_t)(a_pack_buf + (kk+3)*64) | (3ULL<<56));
+                    AMX_OP_GPR(0, (uint64_t)(b + (kk+0)*ldb + j_blk));
+                    AMX_OP_GPR(12, FMA32_Y(0));
+                    AMX_OP_GPR(0, (uint64_t)(b + (kk+1)*ldb + j_blk));
+                    AMX_OP_GPR(12, FMA32_Y(1));
+                    AMX_OP_GPR(0, (uint64_t)(b + (kk+2)*ldb + j_blk));
+                    AMX_OP_GPR(12, FMA32_Y(2));
+                    AMX_OP_GPR(0, (uint64_t)(b + (kk+3)*ldb + j_blk));
+                    AMX_OP_GPR(12, FMA32_Y(3));
+                }
+                for (; kk < k; kk++) {
+                    AMX_OP_GPR(1, (uint64_t)(a_pack_buf + kk*64));
+                    AMX_OP_GPR(0, (uint64_t)(b + kk*ldb + j_blk));
+                    AMX_OP_GPR(12, 0);
+                }
+                #undef FMA32_Y
+                
+                for (int r = 0; r < tile_m; r++)
+                    AMX_OP_GPR(5, ((uint64_t)(z_dst + r*64)) | ((uint64_t)(r*4) << 56));
+            }
+        } else {
+            // Pre-packed B path
+            const uint8_t* b_packed = (const uint8_t*)b;
+            for (int jt = 0; jt < n_j_tiles; jt++) {
+                const uint8_t* bp = b_packed + jt * k * TILE_BYTES;
+                uint8_t* z_dst = z_buf + jt * tile_m * TILE_BYTES;
+                amx_f32_tile_kernel_4y(a_pack_buf, bp, z_dst, k, tile_m);
+            }
         }
         
-        // Compute all j-tiles, storing to contiguous z_buf
-        for (int jt = 0; jt < n_j_tiles; jt++) {
-            const uint8_t* bp = b_packed + jt * k * TILE_BYTES;
-            uint8_t* z_dst = z_buf + jt * tile_m * TILE_BYTES;
-            amx_f32_tile_kernel_4y(a_pack_buf, bp, z_dst, k, tile_m);
-        }
-        
-        // Bulk copy z_buf → C row
+        // Bulk copy z_buf → C
         for (int ii = 0; ii < tile_m; ii++) {
             for (int jt = 0; jt < n_j_tiles; jt++) {
                 int j_blk = jt * TILE;
