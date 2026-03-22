@@ -153,15 +153,15 @@ mod inner {
                 while ks < k {
                     let akc = kc.min(k - ks);
                     if first {
-                        amx_sys::amx_f32_tile_kernel(ap.add(ks * TILE_BYTES), bp.add(ks * TILE_BYTES), z_buf, akc as i32, tile_m as i32);
+                        amx_sys::amx_f32_tile_kernel_4y(ap.add(ks * TILE_BYTES), bp.add(ks * TILE_BYTES), z_buf, akc as i32, tile_m as i32);
                         first = false;
                     } else {
-                        amx_sys::amx_f32_tile_kernel_accum(ap.add(ks * TILE_BYTES), bp.add(ks * TILE_BYTES), z_buf, akc as i32, tile_m as i32);
+                        amx_sys::amx_f32_tile_kernel_4y_accum(ap.add(ks * TILE_BYTES), bp.add(ks * TILE_BYTES), z_buf, akc as i32, tile_m as i32);
                     }
                     ks += kc;
                 }
             } else {
-                amx_sys::amx_f32_tile_kernel(ap, bp, z_buf, k as i32, tile_m as i32);
+                amx_sys::amx_f32_tile_kernel_4y(ap, bp, z_buf, k as i32, tile_m as i32);
             }
 
             for ii in 0..tile_m {

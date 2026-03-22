@@ -451,10 +451,10 @@ void amx_f32_tile_kernel_4y(const void* a_panel, const void* b_panel,
     // Load 4 A columns into Y[0..3], then for each B row load + fma32
     //
     // fma32 operand Y-pair selection (from Apple's Accelerate):
-    //   From Apple's Accelerate: operand bits for Y register selection
-    //   Y register row is encoded in the Y offset field (bits 19:10)
-    //   Y row 0 = 0 byte offset, Y row 1 = 64 byte offset, etc.
-    #define FMA32_Y(row) ((uint64_t)(row) * 64 << 10)
+    // fma32 Y-row selection encoding (verified experimentally on M4 Pro):
+    //   Bits [8:6] = Y register row (0-7)
+    //   Y row 0 = 0x00, Y row 1 = 0x40, Y row 2 = 0x80, Y row 3 = 0xC0
+    #define FMA32_Y(row) ((uint64_t)(row) << 6)
 
     int kk = 0;
     for (; kk + 3 < k; kk += 4) {
@@ -464,19 +464,16 @@ void amx_f32_tile_kernel_4y(const void* a_panel, const void* b_panel,
         AMX_OP_GPR(1, (uint64_t)(ap + (kk+2) * 64) | (2ULL << 56));
         AMX_OP_GPR(1, (uint64_t)(ap + (kk+3) * 64) | (3ULL << 56));
 
-        // B[kk+0] into X[0], fma32 X[0]*Y[0]
+        // For each B row, load into X[0] and fma32 with corresponding Y
         AMX_OP_GPR(0, (uint64_t)(bp + (kk+0) * 64));
         AMX_OP_GPR(12, FMA32_Y(0));
 
-        // B[kk+1] into X[0], fma32 X[0]*Y[1]
         AMX_OP_GPR(0, (uint64_t)(bp + (kk+1) * 64));
         AMX_OP_GPR(12, FMA32_Y(1));
 
-        // B[kk+2] into X[0], fma32 X[0]*Y[2]
         AMX_OP_GPR(0, (uint64_t)(bp + (kk+2) * 64));
         AMX_OP_GPR(12, FMA32_Y(2));
 
-        // B[kk+3] into X[0], fma32 X[0]*Y[3]
         AMX_OP_GPR(0, (uint64_t)(bp + (kk+3) * 64));
         AMX_OP_GPR(12, FMA32_Y(3));
     }
@@ -514,7 +511,7 @@ void amx_f32_tile_kernel_4y_accum(const void* a_panel, const void* b_panel,
     const uint8_t* ap = (const uint8_t*)a_panel;
     const uint8_t* bp = (const uint8_t*)b_panel;
 
-    #define FMA32_Y(row) ((uint64_t)(row) * 64 << 10)
+    #define FMA32_Y(row) ((uint64_t)(row) << 6)
     int kk = 0;
     for (; kk + 3 < k; kk += 4) {
         AMX_OP_GPR(1, (uint64_t)(ap + (kk+0) * 64) | (0ULL << 56));

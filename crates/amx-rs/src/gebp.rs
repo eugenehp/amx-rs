@@ -182,7 +182,7 @@ unsafe fn gebp_macro_kernel(
             let bp = b_packed.add(jr * kc * TILE_BYTES);
 
             if first_kc {
-                amx_f32_tile_kernel(ap, bp, z_buf, kc as i32, tile_m as i32);
+                amx_f32_tile_kernel_4y(ap, bp, z_buf, kc as i32, tile_m as i32);
             } else {
                 // Subsequent KC blocks: load partial sums from C into z_buf,
                 // accumulate, store back
@@ -196,7 +196,7 @@ unsafe fn gebp_macro_kernel(
                         *z_row.add(jj) = 0.0;
                     }
                 }
-                amx_f32_tile_kernel_accum(ap, bp, z_buf, kc as i32, tile_m as i32);
+                amx_f32_tile_kernel_4y_accum(ap, bp, z_buf, kc as i32, tile_m as i32);
             }
 
             // Store z_buf → C
@@ -567,7 +567,7 @@ mod tests {
     fn test_gebp_small() {
         let a = make_matrix(4, 5);
         let b = make_matrix(5, 6);
-        let c_amx = a.matmul_amx(&b).unwrap();
+        let c_amx = a.matmul_scalar(&b).unwrap();
         let c_gebp = a.matmul_gebp(&b).unwrap();
         assert_close(c_gebp.as_slice(), c_amx.as_slice(), 1e-5);
     }
@@ -576,7 +576,7 @@ mod tests {
     fn test_gebp_16x16() {
         let a = make_matrix(16, 16);
         let b = make_matrix(16, 16);
-        let c_amx = a.matmul_amx(&b).unwrap();
+        let c_amx = a.matmul_scalar(&b).unwrap();
         let c_gebp = a.matmul_gebp(&b).unwrap();
         assert_close(c_gebp.as_slice(), c_amx.as_slice(), 1e-5);
     }
@@ -585,7 +585,7 @@ mod tests {
     fn test_gebp_non_aligned() {
         let a = make_matrix(37, 53);
         let b = make_matrix(53, 41);
-        let c_amx = a.matmul_amx(&b).unwrap();
+        let c_amx = a.matmul_scalar(&b).unwrap();
         let c_gebp = a.matmul_gebp(&b).unwrap();
         assert_close(c_gebp.as_slice(), c_amx.as_slice(), 1e-4);
     }
@@ -594,7 +594,7 @@ mod tests {
     fn test_gebp_large_needs_mc_blocking() {
         let a = make_matrix(300, 100);
         let b = make_matrix(100, 80);
-        let c_amx = a.matmul_amx(&b).unwrap();
+        let c_amx = a.matmul_scalar(&b).unwrap();
         let c_gebp = a.matmul_gebp(&b).unwrap();
         assert_close(c_gebp.as_slice(), c_amx.as_slice(), 1e-4);
     }
@@ -603,7 +603,7 @@ mod tests {
     fn test_gebp_large_needs_kc_blocking() {
         let a = make_matrix(64, 600);
         let b = make_matrix(600, 64);
-        let c_amx = a.matmul_amx(&b).unwrap();
+        let c_amx = a.matmul_scalar(&b).unwrap();
         let c_gebp = a.matmul_gebp(&b).unwrap();
         assert_close(c_gebp.as_slice(), c_amx.as_slice(), 1e-4);
     }
@@ -612,7 +612,7 @@ mod tests {
     fn test_gebp_256x256() {
         let a = make_matrix(256, 256);
         let b = make_matrix(256, 256);
-        let c_amx = a.matmul_amx(&b).unwrap();
+        let c_amx = a.matmul_scalar(&b).unwrap();
         let c_gebp = a.matmul_gebp(&b).unwrap();
         assert_close(c_gebp.as_slice(), c_amx.as_slice(), 1e-4);
     }
@@ -622,7 +622,7 @@ mod tests {
     fn test_gebp_parallel_256x256() {
         let a = make_matrix(256, 256);
         let b = make_matrix(256, 256);
-        let c_amx = a.matmul_amx(&b).unwrap();
+        let c_amx = a.matmul_scalar(&b).unwrap();
         let c_par = a.matmul_gebp_parallel(&b, 4).unwrap();
         assert_close(c_par.as_slice(), c_amx.as_slice(), 1e-4);
     }
