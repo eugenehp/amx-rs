@@ -422,11 +422,14 @@ void amx_f32_tile_kernel_2j(const void* a_panel,
         AMX_OP_GPR(5, ((uint64_t)(p1 + i * 64)) | ((uint64_t)(i * 4) << 56));
 }
 
+#include <arm_neon.h>
+
 // ── GEBP packing helper ──────────────────────────────────────────────
 
 // Pack A panel for GEBP: A[i_start..i_end, k_start..k_end] → dst
 // with column-gather into MR=16 wide vectors.
 // row-major: A[i,j] = a[i*lda + j]
+// Uses NEON for 4× gather when possible.
 void gebp_pack_a_panel(const float* a, int lda,
                         int i_start, int i_end,
                         int k_start, int k_end,
@@ -445,8 +448,29 @@ void gebp_pack_a_panel(const float* a, int lda,
         const float* rows[16];
         for (int ii = 0; ii < tile_m; ii++)
             rows[ii] = a + (i_blk + ii) * lda + k_start;
+        // Zero remaining row pointers to avoid UB
+        for (int ii = tile_m; ii < MR; ii++)
+            rows[ii] = rows[0]; // dummy, output will be zeroed
 
-        for (int kk = 0; kk < kc; kk++) {
+        // Process 4 k-values at a time using NEON
+        int kk = 0;
+        for (; kk + 3 < kc; kk += 4) {
+            for (int ii = 0; ii < tile_m; ii++) {
+                float32x4_t v = vld1q_f32(rows[ii] + kk);
+                out[(kk+0)*MR + ii] = vgetq_lane_f32(v, 0);
+                out[(kk+1)*MR + ii] = vgetq_lane_f32(v, 1);
+                out[(kk+2)*MR + ii] = vgetq_lane_f32(v, 2);
+                out[(kk+3)*MR + ii] = vgetq_lane_f32(v, 3);
+            }
+            for (int ii = tile_m; ii < MR; ii++) {
+                out[(kk+0)*MR + ii] = 0.0f;
+                out[(kk+1)*MR + ii] = 0.0f;
+                out[(kk+2)*MR + ii] = 0.0f;
+                out[(kk+3)*MR + ii] = 0.0f;
+            }
+        }
+        // Scalar remainder
+        for (; kk < kc; kk++) {
             float* d = out + kk * MR;
             for (int ii = 0; ii < tile_m; ii++)
                 d[ii] = rows[ii][kk];
@@ -457,8 +481,6 @@ void gebp_pack_a_panel(const float* a, int lda,
 }
 
 // ── NEON kernels ─────────────────────────────────────────────────────
-
-#include <arm_neon.h>
 
 // NEON-vectorized A packing: gather columns into 64-byte vectors.
 // For each k, gathers A[i_blk+0..tile_m-1, k] into dst[k*64..k*64+tile_m*4-1].

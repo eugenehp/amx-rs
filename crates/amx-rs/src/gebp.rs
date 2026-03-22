@@ -48,7 +48,7 @@ const NR: usize = TILE; // 16
 /// KC: K-dimension block for L1 residency.
 ///
 /// Working set per µ-kernel call: KC × (MR + NR) × 4 bytes.
-/// With KC=512: 512 × 32 × 4 = 64 KB → fits in 64 KB L1D.
+/// With KC=512: 512 × 32 × 4 = 64 KB → fills 64 KB L1D.
 const KC: usize = 512;
 
 /// MC: M-dimension block for L2 residency.
@@ -59,12 +59,13 @@ const KC: usize = 512;
 /// for B̃ streaming and OS overhead.
 const MC: usize = 256;
 
-/// NC: N-dimension block for L3/SLC residency.
+/// NC: N-dimension block for shared L2 residency.
 ///
-/// The packed B̃ panel is KC × NC × 4 bytes.
-/// With KC=512, NC=4096: 512 × 4096 × 4 = 8 MB.
-/// Apple Silicon SLC is ~32 MB; 8 MB is comfortable.
-const NC: usize = 4096;
+/// The packed B̃ panel is KC × NC × 4 bytes and is read by ALL cores.
+/// Apple Silicon L2 is 4 MB shared across all cores in a cluster.
+/// B̃ must fit comfortably: KC × NC × 4 ≤ ~2 MB (leave room for Ã streaming).
+/// With KC=512, NC=1024: 512 × 1024 × 4 = 2 MB ✓
+const NC: usize = 1024;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Packing routines
@@ -384,6 +385,15 @@ impl Matrix<f32> {
                 // current NC block. We need the j-tile offset within that block.
                 let j_offset_tiles = (self.jc_start - self.jc_start) / NR; // always 0 for per-tile dispatch
 
+                // Pin to P-core for maximum AMX throughput
+                #[cfg(target_os = "macos")]
+                {
+                    extern "C" {
+                        fn pthread_set_qos_class_self_np(qos: u32, pri: i32) -> i32;
+                    }
+                    let _ = unsafe { pthread_set_qos_class_self_np(0x21, 0) }; // USER_INTERACTIVE → P-core
+                }
+
                 amx_sys::amx_set();
 
                 gebp_macro_kernel(
@@ -427,13 +437,41 @@ impl Matrix<f32> {
                 let first_kc = pc == 0;
 
                 // Pack B̃ panel for this (jc, pc) block
+                // Parallelize across j-tiles for large panels
+                #[cfg(feature = "parallel")]
+                {
+                    let n_j_tiles = (actual_nc + NR - 1) / NR;
+                    if n_j_tiles >= 4 {
+                        use rayon::prelude::*;
+                        let b_raw = b as usize;
+                        let b_buf_raw = b_buf as usize;
+                        (0..n_j_tiles).into_par_iter().for_each(|jt| {
+                            let b_ptr = b_raw as *const f32;
+                            let out = b_buf_raw as *mut f32;
+                            let j_blk = jc + jt * NR;
+                            let tile_n = NR.min(jc + actual_nc - j_blk);
+                            let base = jt * actual_kc * NR;
+                            for kk in 0..actual_kc {
+                                let row = pc + kk;
+                                unsafe {
+                                    let src = b_ptr.add(row * n + j_blk);
+                                    let dst = out.add(base + kk * NR);
+                                    core::ptr::copy_nonoverlapping(src, dst, tile_n);
+                                    for jj in tile_n..NR {
+                                        *dst.add(jj) = 0.0;
+                                    }
+                                }
+                            }
+                        });
+                    } else {
+                        unsafe {
+                            pack_b_panel(b, n, pc, pc + actual_kc, jc, jc + actual_nc, b_buf);
+                        }
+                    }
+                }
+                #[cfg(not(feature = "parallel"))]
                 unsafe {
-                    pack_b_panel(
-                        b, n,
-                        pc, pc + actual_kc,
-                        jc, jc + actual_nc,
-                        b_buf,
-                    );
+                    pack_b_panel(b, n, pc, pc + actual_kc, jc, jc + actual_nc, b_buf);
                 }
 
                 // Build 2D work list: (ic_block, jc_block) pairs

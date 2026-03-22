@@ -312,9 +312,6 @@ impl Matrix<f32> {
                 // GEBP with full cache blocking for large matrices;
                 // direct AMX tiling for medium matrices where GEBP packing
                 // overhead would dominate.
-                // GEBP with full L1/L2/L3 cache blocking for large matrices
-                // where the working set exceeds L2 cache (4 MB on Apple Silicon).
-                // For medium matrices, direct AMX tiling with simpler packing wins.
                 let total_ops = m * k * n;
                 let min_dim = m.min(k).min(n);
                 let use_gebp = total_ops > 200_000_000 && min_dim >= 64;
@@ -515,7 +512,7 @@ impl Matrix<f32> {
         let tiles_per_thread = total_tiles / n_threads;
 
         #[cfg(feature = "parallel")]
-        let min_tiles_per_thread = 64; // need enough work per thread
+        let min_tiles_per_thread = 64;
         #[cfg(not(feature = "parallel"))]
         let min_tiles_per_thread = 128;
 
@@ -572,6 +569,14 @@ impl Matrix<f32> {
                 let z_buf = aligned_alloc(TILE * TILE_BYTES, 64);
 
                 unsafe {
+                    // Pin to P-core for maximum AMX throughput
+                    #[cfg(target_os = "macos")]
+                    {
+                        extern "C" {
+                            fn pthread_set_qos_class_self_np(qos: u32, pri: i32) -> i32;
+                        }
+                        let _ = pthread_set_qos_class_self_np(0x21, 0);
+                    }
                     amx_set();
 
                     for &(it, jt) in chunk {
